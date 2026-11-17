@@ -1,12 +1,14 @@
 #!/bin/sh
-''''[ -f "$0" ] || { echo "h100_check: 请用 curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/main/run.sh | sudo bash" >&2; exit 3; }  # '''
+''''[ -f "$0" ] || { echo "gpu_check: 请用 curl -fsSL https://raw.githubusercontent.com/rivia7/gpu-check/main/run.sh | sudo bash" >&2; exit 3; }  # '''
 ''''command -v python3 >/dev/null 2>&1 && exec python3 "$0" "$@"                        # '''
 ''''[ -x /usr/libexec/platform-python ] && exec /usr/libexec/platform-python "$0" "$@"    # '''
-''''echo "h100_check: 需要 Python 3.6+（未找到 python3 或 platform-python）" >&2; exit 3 # '''
+''''echo "gpu_check: 需要 Python 3.6+（未找到 python3 或 platform-python）" >&2; exit 3 # '''
 #
-# h100_check.py —— GPU 服务器只读检测脚本（重点：H100 真伪核验）
-#   硬件清单 + IB 网卡 + NVLink 拓扑 + GPU 型号真伪核验（防 H20/H800 冒充 H100、4090 D 冒充 4090、nvidia-smi 篡改）
-#   型号库覆盖主流数据中心卡（H/B/A/L/V/T/P 系列）、专业卡（RTX PRO / Ada / A 系列 / Quadro）和 GeForce RTX 20~50 系列
+# gpu_check.py —— GPU 服务器只读检测与真伪核验（项目原名 h100-check，v1.3.0 及以前叫 h100_check.py）
+#   硬件清单 + IB 网卡 + NVLink 拓扑 + GPU 型号真伪核验：按芯片熔丝决定的设备 ID 识别型号，再与驱动、NVML、nvidia-smi 交叉比对，
+#   能识别 H20/H800 冒充 H100、4090 D 冒充 4090、RTX PRO 6000D 冒充 6000、矿卡冒充计算卡、nvidia-smi 被篡改等情况
+#   型号库覆盖 Pascal 到 Blackwell：数据中心卡（H/B/A/L/V/T/P 系列）、专业卡（RTX PRO / Ada / A 系列 / Quadro）、
+#   GeForce（GTX 10 系 ~ RTX 50 系）和矿卡
 #
 # 对线上业务零干扰：
 #   * 只读：仅读取 sysfs/procfs，调用 nvidia-smi / NVML 的查询接口，以及 dmidecode、lsblk 等只读命令；
@@ -14,8 +16,8 @@
 #   * 不修改任何配置（时钟、功耗墙、ECC、MIG、持久模式、Fabric Manager 等一律不碰）；
 #   * 自身以 nice 19 + ionice idle 运行，所有外部命令都有超时，默认不写任何文件。
 #
-# 用法：sudo ./h100_check.py [-o report.txt] [--expect h100|h100-pcie|4090|any ...] [--expect-gpus 8] [--cuda]
-#       默认 --expect h100-sxm：期望 H100 SXM5（NVLink 版），PCIe 版、NVL 版判“形态不符”
+# 用法：sudo ./gpu_check.py [-o report.txt] [--expect h100-sxm|h100|a100|4090|pro6000d|any ...] [--expect-gpus 8] [--cuda]
+#       默认 --expect h100-sxm：期望 H100 SXM5（NVLink 版），PCIe 版、NVL 版判“形态不符”；其它机器用 --expect 指定型号
 #       非 root 也能运行，但内存条、整机序列号、网卡料号、内核日志等需要 root 才能读取。
 #
 # 退出码：0=全部通过  1=有告警（健康/配置类）  2=真伪不通过（不是期望的型号，或疑似篡改）  3=运行错误
@@ -37,7 +39,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from collections import Counter
 
-VERSION = '1.3.0'
+VERSION = '1.4.0'
 DEFAULT_EXPECT = 'h100-sxm'   # 默认核验 H100 SXM5，即国内常说的“NVLink 版”（HGX 机型）
 
 OK, INFO, WARN, FAIL = 0, 1, 2, 3
@@ -55,7 +57,6 @@ class G(object):
 
 # ============================================================================
 # 型号库：PCI 设备 ID 由 GPU 芯片熔丝决定，改名、改标签、改 nvidia-smi 都改不了。
-# 来源：pci.ids 数据库 + NVIDIA 驱动 README 支持列表（open-gpu-kernel-modules）+ 官方规格。
 #   family=型号名（与 nvidia-smi / NVML / 驱动报告的名称比对）  keys=同一设备 ID 的多个合法型号名
 #   tier=dc 数据中心卡 / ws 专业卡 / gf 消费级（GeForce、TITAN）
 #   sms=SM 数  bus=显存位宽(bit)  mem=显存 GB（可列多个合法值）  maxw=最大功耗墙(W)  maxsm/maxmem=最大频率(MHz)
@@ -63,7 +64,7 @@ class G(object):
 # 型号库里没有的设备 ID，退回用本机 pci.ids（lspci）识别，再与驱动报告的名称交叉核对。
 # 来源：设备 ID 与名称取自 NVIDIA 驱动 README 的支持列表（supportedchips.html）和 pci.ids；规格取自 NVIDIA 数据表，
 # 并与 TechPowerUp（dbgpu）、维基百科交叉核对，有两个来源一致才写入，拿不准的留空（只识别型号、不比规格）。
-# 复核：python3 tools/verify_db.py --dbgpu
+# 复核：python3 -I tools/verify_db.py --dbgpu
 # ============================================================================
 
 def _chip_arch(chip):
@@ -1657,6 +1658,25 @@ def unknown_check(devid, names, exp):
     return WARN, why + '，无法用硬件 ID 独立核验'
 
 
+def expect_hint(gpus, exp):
+    """按默认目标核验、本机却是别的型号时，告诉用户怎样指定 --expect（给出能识别回同一型号的最短写法）"""
+    toks = []
+    for g in gpus:
+        db = g['db']
+        if not db:
+            continue
+        fam = db['family'].lower()
+        for t in (re.sub(r'^(nvidia|geforce|quadro|rtx|gtx) ', '', fam).replace(' ', ''), fam.replace(' ', ''),
+                  fam.replace(' ', '-')):
+            e = parse_expect(t)
+            if e and e['key'] in db_keys(db):
+                if t not in toks:
+                    toks.append(t)
+                break
+    how = '请加 --expect %s' % ' 或 '.join(toks) if 0 < len(toks) <= 3 else '请用 --expect 指定期望的型号'
+    return '本次按默认目标 %s 核验。如果要核验的就是本机这种型号，%s；也可以用 --expect any 只做一致性检查。' % (exp['label'], how)
+
+
 def expect_check(db, exp):
     sku, note = db['sku'], db['note']
     via = '（型号库中没有该设备 ID，按本机 pci.ids 识别）' if db.get('src') == 'pci.ids' else ''
@@ -2162,7 +2182,7 @@ def render(ctx, args, elapsed):
     rep = Report()
     st = ctx['sys']
     W = 108
-    title, ver = '  GPU 服务器检测报告', 'h100_check v' + VERSION
+    title, ver = '  GPU 服务器检测报告', 'gpu_check v' + VERSION
     rep.add(bold('=' * W))
     rep.add(bold(title) + ' ' * max(1, W - dwidth(title) - len(ver)) + dim(ver))
     rep.add(bold('=' * W))
@@ -2192,7 +2212,7 @@ def render(ctx, args, elapsed):
         rep.section('附：脚本自身异常（不影响其它检测项，请反馈给脚本维护者）')
         for e in ERRORS:
             rep.add('  - ' + e)
-    render_conclusion(rep, ctx)
+    render_conclusion(rep, ctx, args)
     return rep
 
 
@@ -2593,7 +2613,7 @@ def auth_level(gpus):
     return FAIL if Findings.worst(['工具链']) == FAIL else lvl
 
 
-def render_conclusion(rep, ctx):
+def render_conclusion(rep, ctx, args):
     rep.section('九、检测结论')
     rows = []
     gpus = ctx['gpus']
@@ -2640,6 +2660,11 @@ def render_conclusion(rep, ctx):
                             % (len(bad), cnt, '；' + hint if hint else '')))
             else:
                 rep.add(red('  总体结论：[不通过] %d 张 GPU 真伪核验不通过（%s），详见第四节。' % (len(bad), cnt)))
+                # 没指定 --expect、本机只是别的型号（没有篡改迹象）时，提示怎样指定期望型号
+                if args.expect == DEFAULT_EXPECT and all(
+                        g['verdict'][1].startswith('非') and
+                        [c['key'] for c in g['checks'] if c['level'] == FAIL] == ['hwid'] for g in bad):
+                    rep.add('  %s：%s' % (cyan('提示'), expect_hint(bad, args.exp)))
         else:
             rep.add(red('  总体结论：[不通过] 工具链疑似被篡改，GPU 信息不可信，详见第四节。'))
     elif auth == WARN:
@@ -2683,7 +2708,7 @@ class Progress(object):
 
     def __call__(self, msg):
         if self.tty:
-            sys.stderr.write('\r\x1b[K[h100_check] 正在采集：%s ...' % msg)
+            sys.stderr.write('\r\x1b[K[gpu_check] 正在采集：%s ...' % msg)
             sys.stderr.flush()
 
     def done(self):
@@ -2749,21 +2774,22 @@ def collect_all(args):
 
 def parse_args():
     ap = argparse.ArgumentParser(
-        prog='h100_check.py',
-        description='GPU 服务器只读检测：硬件清单、IB 网卡、NVLink 拓扑、GPU 型号真伪核验（重点防 H20/H800 冒充 H100；'
-                    '不影响线上业务）。',
+        prog='gpu_check.py',
+        description='GPU 服务器只读检测：硬件清单、IB 网卡、NVLink 拓扑、GPU 型号真伪核验（按硬件设备 ID 识别 H20/H800 '
+                    '冒充 H100、4090 D 冒充 4090、矿卡等；不影响线上业务）。',
         epilog='退出码：0=通过 1=有告警 2=真伪不通过（不是期望的型号，或疑似篡改） 3=运行错误')
     ap.add_argument('-o', '--output', metavar='FILE', help='同时把报告（无颜色）保存到文件')
     ap.add_argument('--expect', default=DEFAULT_EXPECT, metavar='型号',
                     help='期望的 GPU 型号，默认 h100-sxm：H100 SXM5，即 NVLink 版（HGX 机型），PCIe 版、NVL 版判“形态不符”。'
                          'h100 表示任意 H100 形态均可；也可用 h100-pcie、h100-nvl。形态后缀 -sxm（同义 -nvlink）/-pcie/-nvl '
-                         '适用于各型号，如 a100-sxm；其它型号如 h20、a800、l40s、l20、4090、4090d、5090、a6000、6000ada；'
+                         '适用于各型号，如 a100-sxm；其它型号如 h20、a100、a800、l40s、l20、4090、4090d、5090、pro6000d、a6000、6000ada、'
+                         '1080ti、cmp170hx；'
                          'any 表示不限型号，只做一致性检查')
     ap.add_argument('--expect-gpus', type=int, metavar='N', help='期望的 GPU 数量（HGX 8 卡机型默认按 8 检查）')
     ap.add_argument('--cuda', action='store_true',
                     help='额外通过 CUDA 驱动 API 读取 SM 数/L2 等属性（只调用 cuInit 与属性查询，不创建上下文、不占显存）')
     ap.add_argument('--no-color', action='store_true', help='禁用颜色')
-    ap.add_argument('-V', '--version', action='version', version='h100_check ' + VERSION)
+    ap.add_argument('-V', '--version', action='version', version='gpu_check ' + VERSION)
     # 以下为离线测试用的隐藏参数
     ap.add_argument('--sysroot', help=argparse.SUPPRESS)
     ap.add_argument('--nvml-lib', default='libnvidia-ml.so.1', help=argparse.SUPPRESS)
@@ -2777,13 +2803,13 @@ def main():
     args = parse_args()
     args.exp = parse_expect(args.expect)
     if args.exp is False:
-        sys.stderr.write('h100_check: 无法识别 --expect %s。示例：h100、h100-sxm、h20、a100、a800-sxm、l40s、l20、4090、'
-                         '4090d、5090、a6000、6000ada、any（不限型号）\n' % args.expect)
+        sys.stderr.write('gpu_check: 无法识别 --expect %s。示例：h100、h100-sxm、h20、a100、a800-sxm、l40s、l20、4090、'
+                         '4090d、5090、pro6000d、a6000、6000ada、any（不限型号）\n' % args.expect)
         return 3
     G.sysroot = (args.sysroot or '').rstrip('/')
     G.test_mode = bool(G.sysroot)
     if not G.test_mode and not sys.platform.startswith('linux'):
-        sys.stderr.write('h100_check: 只支持 Linux\n')
+        sys.stderr.write('gpu_check: 只支持 Linux\n')
         return 3
     G.is_root = args.assume_root or os.geteuid() == 0
     G.color = (sys.stdout.isatty() and not args.no_color and os.environ.get('TERM') != 'dumb'
@@ -2818,4 +2844,4 @@ if __name__ == '__main__':
         sys.exit(main())
     except KeyboardInterrupt:
         sys.exit(130)
-# ---- end of h100_check.py ----
+# ---- end of gpu_check.py ----

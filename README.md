@@ -1,37 +1,47 @@
-# h100_check — GPU 服务器只读检测（重点：H100 真伪核验）
+# gpu-check — GPU 服务器只读检测与真伪核验
 
-单文件脚本 `h100_check.py`，只用 Python 3.6+ 标准库，不需要 pip 安装任何东西。它在 GPU 服务器上收集硬件配置，在终端输出表格报告，重点核验 GPU 是否为真 H100（能识别 H20 / H800 冒充）。也能识别其它主流 GPU（A100/A800、L40S/L20、RTX 4090/4090 D、RTX 5090 等，见「支持的型号」），核验型号是否与期望一致。
+单文件脚本 `gpu_check.py`，只用 Python 3.6+ 标准库，不需要 pip 安装任何东西。在 GPU 服务器上运行，它会：
+
+- **收集硬件配置**：整机、CPU、内存、存储、GPU、NVLink 拓扑、IB / RDMA 网卡，在终端输出表格报告；
+- **核验 GPU 真伪**：按芯片熔丝决定的设备 ID 识别型号，再与驱动、NVML、nvidia-smi 报告的名称和规格指纹交叉比对。能识别 H20 / H800 冒充 H100、RTX 4090 D 冒充 4090、RTX PRO 6000D 冒充 RTX PRO 6000、矿卡冒充计算卡，以及 nvidia-smi 被篡改等情况；
+- **检查健康状况**：NVLink 掉链、IB 端口、PCIe 降速、Xid、ECC、行重映射等。
+
+型号库覆盖 Pascal 到 Blackwell 的 235 个设备 ID，包括数据中心卡、专业卡、GeForce 和矿卡，见「支持的型号」。
 
 **检测全程只读，不影响线上业务**：不创建 CUDA 上下文、不占显存、不跑任何负载或带宽测试、不重置计数器、不改任何配置。详见下面的「对线上业务的影响」一节。
+
+> 本项目原名 `h100-check`，v1.3.0 及以前的脚本叫 `h100_check.py`。旧的 GitHub 地址会自动跳转到新仓库，旧的一键命令、中转地址和环境变量名照常可用。
 
 ## 一键运行
 
 在 GPU 服务器上执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/main/run.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/rivia7/gpu-check/main/run.sh | sudo bash
 ```
 
-默认按 **H100 SXM5** 核验，也就是国内常说的「NVLink 版」（HGX 8 卡 / 4 卡机型），PCIe 版和 NVL 版会判为「形态不符」。
+不加参数时默认按 **H100 SXM5** 核验，也就是国内常说的「NVLink 版」（HGX 8 卡 / 4 卡机型），PCIe 版和 NVL 版会判为「形态不符」。
 
-参数接在 `bash -s --` 后面。比如检测 PCIe 版的 H100 机器，并把报告另存一份：
+其它机器用 `--expect` 指定期望型号，参数接在 `bash -s --` 后面，`-o` 可以把报告另存一份：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/main/run.sh | sudo bash -s -- --expect h100-pcie -o /tmp/h100_report.txt
+curl -fsSL https://raw.githubusercontent.com/rivia7/gpu-check/main/run.sh | sudo bash -s -- --expect 4090 -o /tmp/gpu_report.txt
+curl -fsSL https://raw.githubusercontent.com/rivia7/gpu-check/main/run.sh | sudo bash -s -- --expect pro6000d
+curl -fsSL https://raw.githubusercontent.com/rivia7/gpu-check/main/run.sh | sudo bash -s -- --expect h100-pcie
 ```
 
-不是 H100 的机器，用 `--expect` 指定期望型号，或用 `--expect any` 只做一致性检查：
+不确定型号时，用 `--expect any` 只识别型号，并检查各数据源是否一致、规格是否吻合：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/main/run.sh | sudo bash -s -- --expect 4090
+curl -fsSL https://raw.githubusercontent.com/rivia7/gpu-check/main/run.sh | sudo bash -s -- --expect any
 ```
 
-`run.sh` 只做三件事：找到 Python 3.6+，把 `h100_check.py` 下载到内存并检查是否完整，再交给 Python 执行。除了 `-o` 指定的报告文件，不在磁盘上留任何东西。不加 `sudo` 也能跑，但会缺少内存条型号、网卡序列号和料号，以及 dmesg 里的 Xid 记录。
+`run.sh` 只做三件事：找到 Python 3.6+，把 `gpu_check.py` 下载到内存并检查是否完整，再交给 Python 执行。除了 `-o` 指定的报告文件，不在磁盘上留任何东西。不加 `sudo` 也能跑，但会缺少内存条型号、网卡序列号和料号，以及 dmesg 里的 Xid 记录。
 
 要固定版本、不受仓库后续更新影响，就直接运行打了标签的版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/v1.3.0/h100_check.py | sudo python3 -
+curl -fsSL https://raw.githubusercontent.com/rivia7/gpu-check/v1.4.0/gpu_check.py | sudo python3 -
 ```
 
 ### 服务器访问不了 GitHub 时
@@ -41,25 +51,25 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/v1.3.0/h100_check
 1. **用中转站**（推荐，见下面「自建中转」一节）。在 GPU 服务器上：
 
    ```bash
-   curl -fsSL http://<中转站>/h100/run.sh | sudo bash
+   curl -fsSL http://<中转站>/gpu/run.sh | sudo bash
    ```
 
 2. **ssh 管道**：在能上网的机器上下载一次，再通过 ssh 管道执行。目标机不需要外网，也不会留下文件：
 
    ```bash
-   curl -fsSLO https://raw.githubusercontent.com/rivia7/h100-check/main/h100_check.py
-   ssh gpu-node 'sudo python3 - --no-color' < h100_check.py > gpu-node.txt
+   curl -fsSLO https://raw.githubusercontent.com/rivia7/gpu-check/main/gpu_check.py
+   ssh gpu-node 'sudo python3 - --no-color' < gpu_check.py > gpu-node.txt
 
    # 批量检查，按退出码汇总
    for h in node01 node02 node03; do
-     ssh "$h" 'sudo python3 - --no-color' < h100_check.py > "report-$h.txt"; echo "$h rc=$?"
+     ssh "$h" 'sudo python3 - --no-color' < gpu_check.py > "report-$h.txt"; echo "$h rc=$?"
    done
    ```
 
-3. **内网 HTTP 服务器**：把 `h100_check.py` 放在 `<地址>/main/h100_check.py`，用 `H100_CHECK_BASE` 指定根地址（或用 `H100_CHECK_URL` 直接指定脚本的完整地址）：
+3. **内网 HTTP 服务器**：把 `gpu_check.py` 放在 `<地址>/main/gpu_check.py`，用 `GPU_CHECK_BASE` 指定根地址（或用 `GPU_CHECK_URL` 直接指定脚本的完整地址）：
 
    ```bash
-   curl -fsSL http://<内网地址>/main/run.sh | sudo env H100_CHECK_BASE=http://<内网地址> bash
+   curl -fsSL http://<内网地址>/main/run.sh | sudo env GPU_CHECK_BASE=http://<内网地址> bash
    ```
 
 ## 参数
@@ -205,41 +215,41 @@ python3 -I tools/verify_db.py --dbgpu    # 另外与 TechPowerUp 数据比对规
 - **内核级伪造防不住**：如果有人改了内核（例如修改开源内核模块，或在 PCI 层伪造设备 ID），所有软件读到的数据都可能是假的。脚本会显示内核模块的 srcversion 和 taint 标志，可与同版本的正常机器比对。
 - **不做算力实测**：要确认实际算力，需要在维护窗口对空闲 GPU 单独压测（比如跑 BF16 GEMM：H100 SXM5 稠密 BF16 理论约 989 TFLOPS，H20 约 148 TFLOPS）。这会占用 GPU，所以脚本有意不做。
 - H20 系列等特供型号没有官方公开的完整规格，判定以硬件 ID 为主，规格只作辅助参考。型号库只写入有可靠来源的规格（见「型号库的来源与核实」），非关键项有偏差时只告警。
-- H100 检测目前只在模拟环境里测试过（见下节），还没在真实 H100 机器上跑过。首次使用建议先在一台确定是正品的机器上跑一遍，作为基线对照。RTX 4090 的测试场景取自一台真实机器的报告。
+- H100 的检测目前只在模拟环境里测试过（见下节），还没在真实 H100 机器上跑过；RTX 4090、RTX PRO 6000D 的测试场景取自真实机器的报告。首次使用建议先在一台确定是正品的机器上跑一遍，作为基线对照。
 
 ## 自建中转
 
 `relay/` 目录是一个 Docker Compose 服务，部署在一台能访问 GitHub 的服务器上，给访问不了 GitHub 的 GPU 服务器提供一键运行入口：
 
 - `sync` 容器每 10 分钟从 GitHub 同步一次 main 分支和所有版本标签。它走 `codeload.github.com` 和 `api.github.com`，不依赖常被墙的 `raw.githubusercontent.com`，只发布末行完整的脚本。
-- `web` 容器（nginx）对外提供 `/h100/` 下的文件。
+- `web` 容器（nginx）对外提供 `/gpu/` 下的文件。改名前的旧路径 `/h100/` 内容相同，继续可用。
 - 两个容器共用同一个 nginx 镜像。
 
-`h100_check.py` 与 GitHub 上的文件逐字节一致。只有 `run.sh` 被改写过：默认下载源改成中转站，标签目录里的 `run.sh` 默认运行同一版本。
+`gpu_check.py` 与 GitHub 上的文件逐字节一致（v1.3.0 及以前的版本目录里是 `h100_check.py`）。只有 `run.sh` 被改写过：默认下载源改成中转站，标签目录里的 `run.sh` 默认运行同一版本。
 
 部署步骤：
 
 ```bash
-scp -r relay/ <中转服务器>:/opt/h100-relay
+scp -r relay/ <中转服务器>:/opt/gpu-relay
 ssh <中转服务器>
-cd /opt/h100-relay
+cd /opt/gpu-relay
 cat > .env <<'EOF'
-PUBLIC_BASE=http://<中转服务器公网 IP 或域名>/h100
+PUBLIC_BASE=http://<中转服务器公网 IP 或域名>/gpu
 NGINX_IMAGE=nginx:1.27-alpine   # Docker Hub 拉不到时换成镜像站，如 mirror.ccs.tencentyun.com/library/nginx:1.27-alpine
 EOF
 docker compose up -d
-curl http://127.0.0.1/h100/     # 使用说明、可用版本、最近同步时间
+curl http://127.0.0.1/gpu/      # 使用说明、可用版本、最近同步时间
 ```
 
 云服务器还要在控制台的防火墙/安全组里放行 TCP 80。部署后，GPU 服务器上这样运行：
 
 ```bash
-curl -fsSL http://<中转站>/h100/run.sh | sudo bash                        # 最新版（main）
-curl -fsSL http://<中转站>/h100/run.sh | sudo bash -s -- --expect any      # 带参数
-curl -fsSL http://<中转站>/h100/v1.3.0/run.sh | sudo bash                 # 指定版本
+curl -fsSL http://<中转站>/gpu/run.sh | sudo bash                        # 最新版（main）
+curl -fsSL http://<中转站>/gpu/run.sh | sudo bash -s -- --expect any      # 带参数
+curl -fsSL http://<中转站>/gpu/v1.4.0/run.sh | sudo bash                 # 指定版本
 ```
 
-中转站走 HTTP 明文。链路不可信时，可以拿 `<版本>/SHA256SUMS` 里 `h100_check.py` 的哈希与 GitHub 上的文件比对。
+中转站走 HTTP 明文。链路不可信时，可以拿 `<版本>/SHA256SUMS` 里 `gpu_check.py` 的哈希与 GitHub 上的文件比对。
 
 ## 离线测试
 
@@ -251,7 +261,7 @@ curl -fsSL http://<中转站>/h100/v1.3.0/run.sh | sudo bash                 # �
 4. stderr 是否为空。
 
 ```bash
-bash tests/run_tests.sh                      # 默认输出到 $TMPDIR/h100_check_tests
+bash tests/run_tests.sh                      # 默认输出到 $TMPDIR/gpu_check_tests
 PYTHON=python3.9 bash tests/run_tests.sh     # 指定解释器
 ```
 
@@ -266,7 +276,7 @@ PYTHON=python3.9 bash tests/run_tests.sh     # 指定解释器
 | `h100 --expect h100-nvlink` | 同义写法 → 通过 |
 | `h100pcie` | 8 张 H100 PCIe：默认（期望 SXM5）→ 形态不符，并提示加 `--expect h100-pcie`；加 `--expect h100` 或 `h100-pcie` → 通过 |
 | `h20 --expect any` | 只检查一致性 → 通过 |
-| `rtx4090` | 8 张 RTX 4090（取自真实机器）：默认按 H100 核验 → 不通过；`--expect any` / `--expect 4090` → 通过，不报 ECC 关闭、peermem |
+| `rtx4090` | 8 张 RTX 4090（取自真实机器）：默认按 H100 核验 → 不通过，并提示加 `--expect 4090`；`--expect any` / `--expect 4090` → 通过，不报 ECC 关闭、peermem |
 | `rtx4090d --expect 4090` | 诚实的 4090 D 机器 → 不通过（非 RTX 4090） |
 | `rtx4090d-fake --expect 4090` | 硬件是 4090 D，nvidia-smi 被篡改成显示 4090 → 不通过 |
 | `rtx4090-48g --expect 4090` | 改装 48GB 显存的 4090 → 通过，有告警（改装大显存） |
@@ -275,4 +285,4 @@ PYTHON=python3.9 bash tests/run_tests.sh     # 指定解释器
 | `unknownid` | 设备 ID 型号库和 pci.ids 都不认识：默认 → 驱动名称是别的型号，不通过；`--expect 6000d` → 名称相符，待确认 |
 | `cmp170hx` | 8 张 CMP 170HX 矿卡（GA100 核心）：`--expect a100` → 不通过，注明是挖矿专用卡；`--expect any` → 通过，识别为 CMP 170HX（70 个 SM） |
 
-此外还有 4 项测试：`tests/test_keys.py` 检查型号名称规则，驱动的官方名称、`--expect` 的各种写法都要识别成正确的型号，型号库每条记录都要自洽；另外 3 项覆盖 `run.sh`：模拟 `curl … | bash` 正常执行；下载不完整时拒绝执行；误把 `h100_check.py` 直接管道给 bash 时给出正确用法提示。
+此外还有 5 项测试：`tests/test_keys.py` 检查型号名称规则，驱动的官方名称、`--expect` 的各种写法都要识别成正确的型号，型号库每条记录都要自洽；另外 4 项覆盖 `run.sh`：模拟 `curl … | bash` 正常执行；改名前的环境变量名 `H100_CHECK_URL` 仍然有效；下载不完整时拒绝执行；误把 `gpu_check.py` 直接管道给 bash 时给出正确用法提示。

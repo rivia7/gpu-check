@@ -11,7 +11,7 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-spec = importlib.util.spec_from_file_location('h100_check', os.path.join(HERE, '..', 'h100_check.py'))
+spec = importlib.util.spec_from_file_location('gpu_check', os.path.join(HERE, '..', 'gpu_check.py'))
 hc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hc)
 

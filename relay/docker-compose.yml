@@ -1,13 +1,13 @@
-# h100-check 中转站：给访问不了 GitHub 的 GPU 服务器提供一键运行入口。
-#   web  ：nginx，对外提供 /h100/ 下的文件
+# gpu-check 中转站：给访问不了 GitHub 的 GPU 服务器提供一键运行入口。
+#   web  ：nginx，对外提供 /gpu/ 下的文件（改名前的旧路径 /h100/ 内容相同，继续可用）
 #   sync ：每隔 INTERVAL 秒从 GitHub 同步 main 分支和所有版本标签（与 web 共用同一个镜像，只多拉一次镜像）
 #
 # 部署：把本目录拷到一台能访问 GitHub 的服务器上，在同一目录建 .env，然后 docker compose up -d
-#   PUBLIC_BASE=http://<公网 IP 或域名>/h100      # 必填，写进 run.sh 作为默认下载源
+#   PUBLIC_BASE=http://<公网 IP 或域名>/gpu       # 必填，写进 run.sh 作为默认下载源
 #   NGINX_IMAGE=nginx:1.27-alpine                 # Docker Hub 拉不到时换成镜像站，如 mirror.ccs.tencentyun.com/library/nginx:1.27-alpine
 #   LISTEN=80                                     # 对外端口；改了端口的话 PUBLIC_BASE 也要带上
 # 之后在 GPU 服务器上：curl -fsSL <PUBLIC_BASE>/run.sh | sudo bash
-name: h100-relay
+name: gpu-relay
 
 x-logging: &logging
   driver: json-file
@@ -32,8 +32,8 @@ services:
     restart: unless-stopped
     entrypoint: ["/bin/sh", "/sync.sh"]
     environment:
-      PUBLIC_BASE: ${PUBLIC_BASE:?在 .env 中设置 PUBLIC_BASE，如 http://1.2.3.4/h100}
-      REPO: ${REPO:-rivia7/h100-check}
+      PUBLIC_BASE: ${PUBLIC_BASE:?在 .env 中设置 PUBLIC_BASE，如 http://1.2.3.4/gpu}
+      REPO: ${REPO:-rivia7/gpu-check}
       INTERVAL: ${INTERVAL:-600}
       TZ: CST-8
     volumes:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-复核 h100_check.py 的内置型号库（维护者用，需要联网；GPU 服务器上用不到）。
+复核 gpu_check.py 的内置型号库（维护者用，需要联网；GPU 服务器上用不到）。
 
   1. 名称核对：NVIDIA 驱动 README 的支持列表里，型号库每个设备 ID 的官方名称都必须能识别成该条目的型号。
      识别错了，真卡会被判“名称不一致”；识别不出，会被判“待确认”。
@@ -51,13 +51,13 @@ TOKENS = ['SXM5', 'SXM4', 'SXM3', 'SXM2', 'SXM', 'PCIe', 'NVL', 'DGXS', 'FHHL', 
 
 
 def get(url, timeout=60):
-    req = urllib.request.Request(url, headers={'User-Agent': 'h100-check-verify-db'})
+    req = urllib.request.Request(url, headers={'User-Agent': 'gpu-check-verify-db'})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 
 
 def load_hc():
-    spec = importlib.util.spec_from_file_location('h100_check', os.path.join(HERE, '..', 'h100_check.py'))
+    spec = importlib.util.spec_from_file_location('gpu_check', os.path.join(HERE, '..', 'gpu_check.py'))
     hc = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(hc)
     return hc
@@ -156,7 +156,7 @@ def compare_dbgpu(hc):
 
 
 def main():
-    ap = argparse.ArgumentParser(description='复核 h100_check.py 的内置型号库（需要联网）')
+    ap = argparse.ArgumentParser(description='复核 gpu_check.py 的内置型号库（需要联网）')
     ap.add_argument('--driver', nargs='*', default=[], metavar='版本', help='再核对这些驱动版本的支持列表（默认只取最新版）')
     ap.add_argument('--dbgpu', action='store_true', help='再与 dbgpu（TechPowerUp 数据）比对规格')
     a = ap.parse_args()

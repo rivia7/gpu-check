@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-生成 h100_check.py 的离线测试夹具：模拟一台 HGX 8 卡服务器（8x GPU + 4x NVSwitch + 8x CX7 NDR + 双口 CX6 Dx + I350）。
+生成 gpu_check.py 的离线测试夹具：模拟一台 HGX 8 卡服务器（8x GPU + 4x NVSwitch + 8x CX7 NDR + 双口 CX6 Dx + I350）。
 产物：<out>/root（模拟的 /sys /proc /etc）、<out>/bin（假命令，每次调用都记录到 <out>/data/calls.log）、
       <out>/nvml.conf（mocknv 动态库读取的 NVML/CUDA 数据）。
 

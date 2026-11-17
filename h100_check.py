@@ -4,8 +4,9 @@
 ''''[ -x /usr/libexec/platform-python ] && exec /usr/libexec/platform-python "$0" "$@"    # '''
 ''''echo "h100_check: 需要 Python 3.6+（未找到 python3 或 platform-python）" >&2; exit 3 # '''
 #
-# h100_check.py —— H100 GPU 服务器只读检测脚本
-#   硬件清单 + IB 网卡 + NVLink 拓扑 + H100 真伪核验（防 H20/H800 冒充、防 nvidia-smi 篡改）
+# h100_check.py —— GPU 服务器只读检测脚本（重点：H100 真伪核验）
+#   硬件清单 + IB 网卡 + NVLink 拓扑 + GPU 型号真伪核验（防 H20/H800 冒充 H100、4090 D 冒充 4090、nvidia-smi 篡改）
+#   型号库覆盖主流数据中心卡（H/B/A/L/V/T/P 系列）、专业卡（RTX PRO / Ada / A 系列 / Quadro）和 GeForce RTX 20~50 系列
 #
 # 对线上业务零干扰：
 #   * 只读：仅读取 sysfs/procfs，调用 nvidia-smi / NVML 的查询接口，以及 dmidecode、lsblk 等只读命令；
@@ -13,10 +14,10 @@
 #   * 不修改任何配置（时钟、功耗墙、ECC、MIG、持久模式、Fabric Manager 等一律不碰）；
 #   * 自身以 nice 19 + ionice idle 运行，所有外部命令都有超时，默认不写任何文件。
 #
-# 用法：sudo ./h100_check.py [-o report.txt] [--expect h100-sxm] [--expect-gpus 8] [--cuda]
+# 用法：sudo ./h100_check.py [-o report.txt] [--expect h100-sxm|4090|any ...] [--expect-gpus 8] [--cuda]
 #       非 root 也能运行，但内存条、整机序列号、网卡料号、内核日志等需要 root 才能读取。
 #
-# 退出码：0=全部通过  1=有告警（健康/配置类）  2=真伪不通过（非 H100 或疑似篡改）  3=运行错误
+# 退出码：0=全部通过  1=有告警（健康/配置类）  2=真伪不通过（不是期望的型号，或疑似篡改）  3=运行错误
 #
 import argparse
 import ctypes
@@ -35,7 +36,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from collections import Counter
 
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 
 OK, INFO, WARN, FAIL = 0, 1, 2, 3
 LEVEL_TEXT = {OK: '通过', INFO: '提示', WARN: '警告', FAIL: '不通过'}
@@ -52,14 +53,31 @@ class G(object):
 
 # ============================================================================
 # 型号库：PCI 设备 ID 由 GPU 芯片熔丝决定，改名、改标签、改 nvidia-smi 都改不了。
-# 来源：pci.ids 数据库 + NVIDIA 驱动 README 支持列表（open-gpu-kernel-modules）。
-#   sms=SM 数  bus=显存位宽(bit)  maxw=最大功耗墙(W)  maxsm/maxmem=最大频率(MHz)
-#   links=NVLink 链路数  strict=参考值可信度高，SM/位宽/显存偏差直接判“不通过”
+# 来源：pci.ids 数据库 + NVIDIA 驱动 README 支持列表（open-gpu-kernel-modules）+ 官方规格。
+#   family=型号名（与 nvidia-smi / NVML / 驱动报告的名称比对）  keys=同一设备 ID 的多个合法型号名
+#   tier=dc 数据中心卡 / ws 专业卡 / gf 消费级（GeForce、TITAN）
+#   sms=SM 数  bus=显存位宽(bit)  mem=显存 GB（可列多个合法值）  maxw=最大功耗墙(W)  maxsm/maxmem=最大频率(MHz)
+#   links=NVLink 链路数  strict=参考值可信度高，SM/位宽/显存偏差直接判“不通过”（其余型号只告警）
+# 型号库里没有的设备 ID，退回用本机 pci.ids（lspci）识别，再与驱动报告的名称交叉核对。
 # ============================================================================
 
+def _chip_arch(chip):
+    """芯片代号 → (架构, 计算能力)"""
+    c = (chip or '').upper()
+    for pre, arch, cc in (('GP100', 'Pascal', '6.0'), ('GP', 'Pascal', '6.1'), ('GV', 'Volta', '7.0'),
+                          ('TU', 'Turing', '7.5'), ('GA100', 'Ampere', '8.0'), ('GA', 'Ampere', '8.6'),
+                          ('AD', 'Ada Lovelace', '8.9'), ('GH', 'Hopper', '9.0'), ('GB1', 'Blackwell', '10.0'),
+                          ('GB2', 'Blackwell', '12.0')):
+        if c.startswith(pre):
+            return arch, cc
+    return None, None
+
+
 def _sku(sku, family, form, mem, arch='Hopper', **kw):
-    d = dict(sku=sku, family=family, form=form, mem=mem, arch=arch, sms=None, bus=None,
-             maxw=None, maxsm=None, maxmem=None, links=None, strict=False, note='')
+    hopper = arch == 'Hopper'
+    d = dict(sku=sku, family=family, form=form, mem=mem, arch=arch, tier='dc', chip='GH100' if hopper else None,
+             cc='9.0' if hopper else None, sms=None, bus=None, maxw=None, maxsm=None, maxmem=None, links=None,
+             strict=False, note='', keys=None, src='db')
     d.update(kw)
     return d
 
@@ -67,6 +85,12 @@ def _sku(sku, family, form, mem, arch='Hopper', **kw):
 _H20 = '面向中国市场的算力阉割特供版（BF16 稠密算力约为 H100 SXM 的 15%）'
 _H800 = '面向中国市场的特供版（NVLink 带宽阉割为 400GB/s，H100 SXM 为 900GB/s）'
 _ES = '未命名的 GH100 设备 ID，可能是工程样品（ES/QS），并非正式零售 H100'
+_A800 = '面向中国市场的特供版（NVLink 带宽阉割为 400GB/s，A100 SXM 为 600GB/s）'
+_L20 = '面向中国市场的特供版（由 L40S 阉割而来，SM 数约为其 2/3）'
+_CN = '面向中国市场的特供版'
+_4090D = '面向中国市场的特供版（114 个 SM，RTX 4090 为 128 个，算力低约 5%~10%）'
+_5090D = '面向中国市场的特供版（AI 算力受驱动/固件限制）'
+_5090DV2 = '面向中国市场的特供版（24GB 显存、384-bit 位宽；RTX 5090 为 32GB、512-bit）'
 
 GPU_DB = {
     # ---- H100 ----
@@ -99,35 +123,182 @@ GPU_DB = {
     0x2302: _sku('GH100 未命名ID', 'GH100?', '?', None, note=_ES),
     0x2343: _sku('GH100 未命名ID', 'GH100?', '?', None, note=_ES),
     0x2345: _sku('GH100-88K-A1', 'GH100?', '?', None, note=_ES),
-    # ---- Ampere ----
-    0x20b0: _sku('A100 SXM4 40GB', 'A100', 'SXM4', 40, arch='Ampere'),
-    0x20b2: _sku('A100 SXM4 80GB', 'A100', 'SXM4', 80, arch='Ampere'),
-    0x20b3: _sku('A100 SXM 64GB', 'A100', 'SXM4', 64, arch='Ampere'),
-    0x20b1: _sku('A100 PCIe 40GB', 'A100', 'PCIe', 40, arch='Ampere'),
-    0x20f1: _sku('A100 PCIe 40GB', 'A100', 'PCIe', 40, arch='Ampere'),
-    0x20b5: _sku('A100 PCIe 80GB', 'A100', 'PCIe', 80, arch='Ampere'),
-    0x20b7: _sku('A30 24GB', 'A30', 'PCIe', 24, arch='Ampere'),
-    0x20bd: _sku('A800 SXM4 40GB', 'A800', 'SXM4', 40, arch='Ampere'),
-    0x20f3: _sku('A800 SXM4 80GB', 'A800', 'SXM4', 80, arch='Ampere'),
-    0x20f5: _sku('A800 PCIe 80GB', 'A800', 'PCIe', 80, arch='Ampere'),
-    0x20f6: _sku('A800 40GB Active', 'A800', 'PCIe', 40, arch='Ampere'),
-    # ---- Ada ----
-    0x26b5: _sku('L40 48GB', 'L40', 'PCIe', 48, arch='Ada Lovelace'),
-    0x26b9: _sku('L40S 48GB', 'L40S', 'PCIe', 48, arch='Ada Lovelace'),
-    0x26ba: _sku('L20 48GB', 'L20', 'PCIe', 48, arch='Ada Lovelace'),
-    0x27b8: _sku('L4 24GB', 'L4', 'PCIe', 24, arch='Ada Lovelace'),
-    0x27b6: _sku('L2', 'L2', 'PCIe', None, arch='Ada Lovelace'),
-    # ---- Blackwell ----
-    0x2901: _sku('B200', 'B200', 'SXM6', None, arch='Blackwell'),
-    0x2909: _sku('B200', 'B200', 'SXM6', None, arch='Blackwell'),
-    0x2941: _sku('GB200', 'GB200', 'Superchip', None, arch='Blackwell'),
-    0x3182: _sku('B300', 'B300', 'SXM6', None, arch='Blackwell'),
 }
 
-FAMILY_RE = re.compile(r'(?<![A-Za-z0-9])(GH200|GB200|GB300|H200|H100|H800|H20|A100|A800|A30|'
-                       r'L40S|L40|L20|L4|L2|B200|B300|B100)(?![0-9])', re.I)
-KNOWN_FAMILIES = {'GH200', 'GB200', 'GB300', 'H200', 'H100', 'H800', 'H20', 'A100', 'A800', 'A30',
-                  'L40S', 'L40', 'L20', 'L4', 'L2', 'B200', 'B300', 'B100'}
+
+def _add(ids, sku, family, chip, tier, mem, form='PCIe', **kw):
+    arch, cc = _chip_arch(chip)
+    for i in ((ids,) if isinstance(ids, int) else ids):
+        GPU_DB[i] = _sku(sku, family, form, mem, arch=arch, cc=cc, chip=chip, tier=tier, **kw)
+
+
+# ---- Blackwell 数据中心 ----
+_add((0x2901, 0x290a), 'B200', 'B200', 'GB100', 'dc', None, form='SXM6')
+_add(0x2909, 'B200 168GB', 'B200', 'GB100', 'dc', None, form='SXM6')
+_add((0x2920, 0x29bc), 'B100', 'B100', 'GB100', 'dc', None, form='SXM6')
+_add(0x2941, 'GB200', 'GB200', 'GB100', 'dc', None, form='Superchip')
+_add(0x3182, 'B300 SXM6', 'B300', 'GB110', 'dc', None, form='SXM6')
+_add((0x31c2, 0x31c3), 'GB300', 'GB300', 'GB110', 'dc', None, form='Superchip')
+# ---- Ampere 数据中心 ----
+_add(0x20b0, 'A100 SXM4 40GB', 'A100', 'GA100', 'dc', 40, form='SXM4', sms=108, bus=5120, maxw=400, links=12)
+_add(0x20b2, 'A100 SXM4 80GB', 'A100', 'GA100', 'dc', 80, form='SXM4', sms=108, bus=5120, maxw=(400, 500), links=12)
+_add(0x20b3, 'A100 SXM 64GB', 'A100', 'GA100', 'dc', 64, form='SXM4', links=12)
+_add((0x20b1, 0x20f1), 'A100 PCIe 40GB', 'A100', 'GA100', 'dc', 40, sms=108, bus=5120, maxw=250)
+_add(0x20b5, 'A100 PCIe 80GB', 'A100', 'GA100', 'dc', 80, sms=108, bus=5120, maxw=300)
+_add(0x20b7, 'A30 24GB', 'A30', 'GA100', 'dc', 24, sms=56, bus=3072, maxw=165)
+_add(0x20bd, 'A800 SXM4 40GB', 'A800', 'GA100', 'dc', 40, form='SXM4', sms=108, bus=5120, links=8, note=_A800)
+_add(0x20f3, 'A800 SXM4 80GB', 'A800', 'GA100', 'dc', 80, form='SXM4', sms=108, bus=5120, links=8, note=_A800)
+_add(0x20f5, 'A800 PCIe 80GB', 'A800', 'GA100', 'dc', 80, sms=108, bus=5120, note=_A800)
+_add(0x20f6, 'A800 40GB Active', 'A800', 'GA100', 'dc', 40, sms=108, bus=5120, note=_A800)
+_add(0x2235, 'A40 48GB', 'A40', 'GA102', 'dc', 48, sms=84, bus=384, maxw=300)
+_add(0x2236, 'A10 24GB', 'A10', 'GA102', 'dc', 24, sms=72, bus=384, maxw=150)
+_add(0x2237, 'A10G 24GB', 'A10G', 'GA102', 'dc', 24, sms=80, bus=384)
+_add(0x25b6, 'A2 / A16 16GB', 'A2', 'GA107', 'dc', 16, sms=10, bus=128, keys=('A2', 'A16'))
+# ---- Ada 数据中心 ----
+_add(0x26b5, 'L40 48GB', 'L40', 'AD102', 'dc', 48, sms=142, bus=384, maxw=300)
+_add(0x26b9, 'L40S 48GB', 'L40S', 'AD102', 'dc', 48, sms=142, bus=384, maxw=350)
+_add((0x26ba, 0x26b7), 'L20 48GB', 'L20', 'AD102', 'dc', 48, sms=92, bus=384, note=_L20)
+_add(0x27b8, 'L4 24GB', 'L4', 'AD104', 'dc', 24, sms=58, bus=192, maxw=72)
+_add(0x27b6, 'L2', 'L2', 'AD104', 'dc', None, note=_CN)
+# ---- Turing / Volta / Pascal 数据中心 ----
+_add(0x1eb8, 'T4 16GB', 'T4', 'TU104', 'dc', 16, sms=40, bus=256, maxw=70)
+_add((0x1db1, 0x1df5), 'V100 SXM2 16GB', 'V100', 'GV100', 'dc', 16, form='SXM2', sms=80, bus=4096, maxw=300, links=6)
+_add(0x1db5, 'V100 SXM2 32GB', 'V100', 'GV100', 'dc', 32, form='SXM2', sms=80, bus=4096, maxw=300, links=6)
+_add(0x1db8, 'V100 SXM3 32GB', 'V100', 'GV100', 'dc', 32, form='SXM3', sms=80, bus=4096, links=6)
+_add(0x1db4, 'V100 PCIe 16GB', 'V100', 'GV100', 'dc', 16, sms=80, bus=4096, maxw=250)
+_add(0x1db6, 'V100 PCIe 32GB', 'V100', 'GV100', 'dc', 32, sms=80, bus=4096, maxw=250)
+_add(0x1db3, 'V100 FHHL 16GB', 'V100', 'GV100', 'dc', 16, sms=80, bus=4096)
+_add((0x1db2, 0x1db7), 'V100 DGXS', 'V100', 'GV100', 'dc', (16, 32), sms=80, bus=4096)
+_add(0x1df6, 'V100S PCIe 32GB', 'V100S', 'GV100', 'dc', 32, sms=80, bus=4096, maxw=250)
+_add(0x15f7, 'P100 PCIe 12GB', 'P100', 'GP100', 'dc', 12, sms=56, bus=3072, maxw=250)
+_add(0x15f8, 'P100 PCIe 16GB', 'P100', 'GP100', 'dc', 16, sms=56, bus=4096, maxw=250)
+_add(0x15f9, 'P100 SXM2 16GB', 'P100', 'GP100', 'dc', 16, form='SXM2', sms=56, bus=4096, maxw=300, links=4)
+_add(0x1b38, 'P40 24GB', 'P40', 'GP102', 'dc', 24, sms=30, bus=384, maxw=250)
+_add(0x1bb3, 'P4 8GB', 'P4', 'GP104', 'dc', 8, sms=20, bus=256, maxw=75)
+# ---- 专业卡（RTX / Quadro）----
+_add(0x2bb1, 'RTX PRO 6000 Blackwell', 'RTX PRO 6000', 'GB202', 'ws', 96, sms=188, bus=512)
+_add(0x2bb5, 'RTX PRO 6000 Blackwell Server', 'RTX PRO 6000', 'GB202', 'dc', 96, sms=188, bus=512)
+_add(0x2bb2, 'RTX PRO 6000D Blackwell', 'RTX PRO 6000D', 'GB202', 'ws', None, note=_CN)
+_add(0x2bb3, 'RTX PRO 5000 Blackwell', 'RTX PRO 5000', 'GB202', 'ws', (48, 72))
+_add(0x26b1, 'RTX 6000 Ada 48GB', 'RTX 6000 Ada', 'AD102', 'ws', 48, sms=142, bus=384, maxw=300)
+_add(0x26b3, 'RTX 5880 Ada 48GB', 'RTX 5880 Ada', 'AD102', 'ws', 48, sms=110, bus=384)
+_add(0x26b2, 'RTX 5000 Ada 32GB', 'RTX 5000 Ada', 'AD102', 'ws', 32, sms=100, bus=256, maxw=250)
+_add(0x27b1, 'RTX 4500 Ada 24GB', 'RTX 4500 Ada', 'AD104', 'ws', 24, sms=60, bus=192, maxw=210)
+_add(0x27b2, 'RTX 4000 Ada 20GB', 'RTX 4000 Ada', 'AD104', 'ws', 20, sms=48, bus=160, maxw=130)
+_add(0x27b0, 'RTX 4000 SFF Ada 20GB', 'RTX 4000 Ada', 'AD104', 'ws', 20, sms=48, bus=160, maxw=70)
+_add(0x28b0, 'RTX 2000 Ada 16GB', 'RTX 2000 Ada', 'AD107', 'ws', 16, sms=22, bus=128)
+_add(0x2230, 'RTX A6000 48GB', 'RTX A6000', 'GA102', 'ws', 48, sms=84, bus=384, maxw=300)
+_add(0x2233, 'RTX A5500 24GB', 'RTX A5500', 'GA102', 'ws', 24, sms=80, bus=384, maxw=230)
+_add(0x2231, 'RTX A5000 24GB', 'RTX A5000', 'GA102', 'ws', 24, sms=64, bus=384, maxw=230)
+_add(0x2232, 'RTX A4500 20GB', 'RTX A4500', 'GA102', 'ws', 20, sms=56, bus=320, maxw=200)
+_add((0x24b0, 0x24b1), 'RTX A4000 16GB', 'RTX A4000', 'GA104', 'ws', 16, sms=48, bus=256)
+_add(0x2531, 'RTX A2000 6GB', 'RTX A2000', 'GA106', 'ws', 6, sms=26, bus=192)
+_add(0x2571, 'RTX A2000 12GB', 'RTX A2000', 'GA106', 'ws', 12, sms=26, bus=192)
+_add((0x1e30, 0x1e78), 'Quadro RTX 6000/8000', 'RTX 6000', 'TU102', 'ws', (24, 48), sms=72, bus=384,
+     keys=('RTX 6000', 'RTX 8000'))
+_add(0x1e36, 'Quadro RTX 6000', 'RTX 6000', 'TU102', 'ws', 24, sms=72, bus=384)
+_add(0x1eb0, 'Quadro RTX 5000', 'RTX 5000', 'TU104', 'ws', 16, sms=48, bus=256)
+_add(0x1eb1, 'Quadro RTX 4000', 'RTX 4000', 'TU104', 'ws', 8, sms=36, bus=256)
+# ---- 消费级 GeForce RTX 50 / 40 / 30 / 20 与 TITAN（功耗墙和频率随板卡厂商不同，不做比对）----
+_add(0x2b85, 'RTX 5090', 'RTX 5090', 'GB202', 'gf', 32, sms=170, bus=512)
+_add(0x2b87, 'RTX 5090 D', 'RTX 5090 D', 'GB202', 'gf', 32, sms=170, bus=512, note=_5090D)
+_add(0x2b8c, 'RTX 5090 D V2', 'RTX 5090 D V2', 'GB202', 'gf', 24, sms=170, bus=384, note=_5090DV2)
+_add(0x2c02, 'RTX 5080', 'RTX 5080', 'GB203', 'gf', 16, sms=84, bus=256)
+_add(0x2c05, 'RTX 5070 Ti', 'RTX 5070 Ti', 'GB203', 'gf', 16, sms=70, bus=256)
+_add((0x2f04, 0x2c09), 'RTX 5070', 'RTX 5070', 'GB205', 'gf', 12, sms=48, bus=192)
+_add(0x2d04, 'RTX 5060 Ti', 'RTX 5060 Ti', 'GB206', 'gf', (8, 16), sms=36, bus=128)
+_add((0x2d05, 0x2f06), 'RTX 5060', 'RTX 5060', 'GB206', 'gf', 8, sms=30, bus=128)
+_add(0x2684, 'RTX 4090', 'RTX 4090', 'AD102', 'gf', 24, sms=128, bus=384)
+_add(0x2685, 'RTX 4090 D', 'RTX 4090 D', 'AD102', 'gf', 24, sms=114, bus=384, note=_4090D)
+_add((0x2702, 0x2703), 'RTX 4080 SUPER', 'RTX 4080 SUPER', 'AD103', 'gf', 16, sms=80, bus=256)
+_add((0x2704, 0x2687), 'RTX 4080', 'RTX 4080', 'AD103', 'gf', 16, sms=76, bus=256)
+_add((0x2705, 0x2689), 'RTX 4070 Ti SUPER', 'RTX 4070 Ti SUPER', 'AD103', 'gf', 16, sms=66, bus=256)
+_add(0x2782, 'RTX 4070 Ti', 'RTX 4070 Ti', 'AD104', 'gf', 12, sms=60, bus=192)
+_add(0x2783, 'RTX 4070 SUPER', 'RTX 4070 SUPER', 'AD104', 'gf', 12, sms=56, bus=192)
+_add((0x2786, 0x2709), 'RTX 4070', 'RTX 4070', 'AD104', 'gf', 12, sms=46, bus=192)
+_add(0x2803, 'RTX 4060 Ti 8GB', 'RTX 4060 Ti', 'AD106', 'gf', 8, sms=34, bus=128)
+_add(0x2805, 'RTX 4060 Ti 16GB', 'RTX 4060 Ti', 'AD106', 'gf', 16, sms=34, bus=128)
+_add(0x2788, 'RTX 4060 Ti', 'RTX 4060 Ti', 'AD104', 'gf', (8, 16), sms=34, bus=128)
+_add((0x2882, 0x2808), 'RTX 4060', 'RTX 4060', 'AD107', 'gf', 8, sms=24, bus=128)
+_add(0x2203, 'RTX 3090 Ti', 'RTX 3090 Ti', 'GA102', 'gf', 24, sms=84, bus=384)
+_add(0x2204, 'RTX 3090', 'RTX 3090', 'GA102', 'gf', 24, sms=82, bus=384)
+_add(0x2208, 'RTX 3080 Ti', 'RTX 3080 Ti', 'GA102', 'gf', 12, sms=80, bus=384)
+_add((0x2206, 0x2216), 'RTX 3080 10GB', 'RTX 3080', 'GA102', 'gf', 10, sms=68, bus=320)
+_add(0x220a, 'RTX 3080 12GB', 'RTX 3080', 'GA102', 'gf', 12, sms=70, bus=384)
+_add((0x2482, 0x2207), 'RTX 3070 Ti', 'RTX 3070 Ti', 'GA104', 'gf', 8, sms=48, bus=256)
+_add((0x2484, 0x2488, 0x248d), 'RTX 3070', 'RTX 3070', 'GA104', 'gf', 8, sms=46, bus=256)
+_add((0x2486, 0x2489, 0x248e, 0x24c9, 0x2414), 'RTX 3060 Ti', 'RTX 3060 Ti', 'GA104', 'gf', 8, sms=38, bus=256)
+_add((0x2503, 0x2504, 0x2509, 0x2544, 0x2487), 'RTX 3060 12GB', 'RTX 3060', 'GA106', 'gf', 12, sms=28, bus=192)
+_add(0x24c7, 'RTX 3060 8GB', 'RTX 3060', 'GA104', 'gf', 8, sms=28, bus=128)
+_add((0x1e04, 0x1e07), 'RTX 2080 Ti', 'RTX 2080 Ti', 'TU102', 'gf', 11, sms=68, bus=352)
+_add(0x1e81, 'RTX 2080 SUPER', 'RTX 2080 SUPER', 'TU104', 'gf', 8, sms=48, bus=256)
+_add((0x1e82, 0x1e87), 'RTX 2080', 'RTX 2080', 'TU104', 'gf', 8, sms=46, bus=256)
+_add((0x1e84, 0x1ec2, 0x1ec7), 'RTX 2070 SUPER', 'RTX 2070 SUPER', 'TU104', 'gf', 8, sms=40, bus=256)
+_add((0x1f02, 0x1f07), 'RTX 2070', 'RTX 2070', 'TU106', 'gf', 8, sms=36, bus=256)
+_add((0x1f06, 0x1f42, 0x1f47), 'RTX 2060 SUPER', 'RTX 2060 SUPER', 'TU106', 'gf', 8, sms=34, bus=256)
+_add((0x1f08, 0x1e89), 'RTX 2060', 'RTX 2060', 'TU106', 'gf', 6, sms=30, bus=192)
+_add(0x1f03, 'RTX 2060 12GB', 'RTX 2060', 'TU106', 'gf', 12, sms=34, bus=192)
+_add(0x1e02, 'TITAN RTX', 'TITAN RTX', 'TU102', 'gf', 24, sms=72, bus=384)
+_add(0x1d81, 'TITAN V', 'TITAN V', 'GV100', 'gf', 12, sms=80, bus=3072)
+
+
+# 从型号名称里提取“型号键”，用来比对不同来源报告的是不是同一型号：
+#   “NVIDIA GeForce RTX 4090 D” → RTX 4090 D   “NVIDIA A100-SXM4-80GB” → A100   “Tesla T4” → T4
+_KEY_RES = [
+    (re.compile(r'\bRTX PRO ?(\d{4}) ?(D?)\b'), lambda m: 'RTX PRO ' + m.group(1) + m.group(2)),
+    (re.compile(r'\bRTX (\d{4})E?(?: SFF)? ?ADA\b'), lambda m: 'RTX %s ADA' % m.group(1)),
+    (re.compile(r'\bRTX (A\d{4})'), lambda m: 'RTX ' + m.group(1)),
+    (re.compile(r'\b(RTX|GTX) ?(\d{4})( ?TI)?( ?SUPER)?( ?D)?( ?V2)?\b'),
+     lambda m: ' '.join(x.strip() for x in m.groups() if x)),
+    (re.compile(r'\bTITAN (RTX|V)\b'), lambda m: 'TITAN ' + m.group(1)),
+    (re.compile(r'(?<![A-Z0-9])(GH200|GB200|GB300|H200|H100|H800|H20|B200|B300|B100|A100|A800|A30|A40|A16|A10G|A10|'
+                r'A2|L40S|L40|L20|L4|L2|V100S|V100|P100|P40|P4|T4)(?![0-9])'), lambda m: m.group(1)),
+]
+
+
+def model_key(name):
+    t = re.sub(r'[\s\-_/,()\[\]]+', ' ', (name or '').upper())
+    for rx, fn in _KEY_RES:
+        m = rx.search(t)
+        if m:
+            return fn(m)
+    return None
+
+
+def db_keys(db):
+    """该型号可接受的型号键（大写）；未命名的工程样品 ID 返回空集合"""
+    if not db or db['family'].endswith('?'):
+        return set()
+    return set(k.upper() for k in (db.get('keys') or (db['family'],)))
+
+
+KNOWN_KEYS = set()
+for _d in GPU_DB.values():
+    KNOWN_KEYS |= db_keys(_d)
+
+
+def cores_per_sm(cc):
+    """每个 SM 的 FP32 核心数：GP100/Volta/Turing/GA100 为 64，其余为 128"""
+    try:
+        ma, mi = [int(x) for x in str(cc).split('.')[:2]]
+    except ValueError:
+        return None
+    if (ma, mi) in ((6, 0), (7, 0), (7, 2), (7, 5), (8, 0)):
+        return 64
+    return 128 if ma in (6, 8, 9, 10, 11, 12) else None
+
+
+def db_from_pciids(name, devid):
+    """型号库里没有的设备 ID：用本机 pci.ids 的名称（如“AD102 [GeForce RTX 4090]”）兜底识别"""
+    m = re.match(r'^\s*(\S+)\s*\[(.+)\]\s*$', name or '')
+    chip, label = (m.group(1), m.group(2)) if m else (None, (name or '').strip())
+    key = model_key(label)
+    if not key:
+        return None
+    arch, cc = _chip_arch(chip)
+    up = label.upper()
+    tier = 'gf' if ('GEFORCE' in up or 'TITAN' in up) else ('ws' if ('RTX' in up or 'QUADRO' in up) else 'dc')
+    return _sku(label, key, '?', None, arch=arch, cc=cc, chip=chip, tier=tier, src='pci.ids')
 
 NVSWITCH_DB = {0x1af1: 'NVSwitch Gen2 (A100)', 0x22a3: 'NVSwitch Gen3 (H100)'}
 
@@ -312,15 +483,20 @@ def compress_ids(ids):
     return ','.join(out)
 
 
-def family_of(name):
-    m = FAMILY_RE.search(name or '')
-    return m.group(1).upper() if m else None
-
-
 def s(v, default='-'):
     if v is None or v == '':
         return default
     return str(v)
+
+
+def iv(v, default='-'):
+    """数值取整显示；0 显示为 0（不会因为 0.0 为假而显示成默认值）"""
+    if v is None or v == '':
+        return default
+    try:
+        return str(int(round(float(v))))
+    except (TypeError, ValueError):
+        return str(v)
 
 
 def fmt_duration(sec):
@@ -538,20 +714,27 @@ def collect_memory():
     if mt:
         mem['total_gib'] = int(mt.group(1)) / 1048576.0
     dmi = which('dmidecode')
-    if G.is_root and dmi:
-        rc, out, _ = run([dmi, '-t', '17'], 30)
-        if rc == 0:
-            dimms = []
-            for block in re.split(r'\n(?=Handle )', out):
-                if 'Memory Device' not in block:
-                    continue
-                kv = {}
-                for line in block.splitlines():
-                    if ':' in line:
-                        k, v = line.split(':', 1)
-                        kv.setdefault(k.strip(), v.strip())
-                dimms.append(kv)
+    if not G.is_root:
+        mem['dimm_note'] = '需 root 运行 dmidecode'
+    elif not dmi:
+        mem['dimm_note'] = '未安装 dmidecode'
+    else:
+        rc, out, err = run([dmi, '-t', '17'], 30)
+        dimms = []
+        for block in re.split(r'\n(?=Handle )', out if rc == 0 else ''):
+            if 'Memory Device' not in block:
+                continue
+            kv = {}
+            for line in block.splitlines():
+                if ':' in line:
+                    k, v = line.split(':', 1)
+                    kv.setdefault(k.strip(), v.strip())
+            dimms.append(kv)
+        if dimms:
             mem['dimms'] = dimms
+        else:
+            why = (err or out or '').strip().splitlines()
+            mem['dimm_note'] = 'dmidecode 没有读到内存条信息%s' % ('：' + clip(why[0], 60) if why else '')
     return mem
 
 
@@ -1305,6 +1488,8 @@ def assemble_gpus(ctx):
                 pass
         rec['devid'] = devid
         rec['db'] = GPU_DB.get(devid)
+        if rec['db'] is None and devid is not None and p:
+            rec['db'] = db_from_pciids((ctx.get('lspci') or {}).get(b), devid)
         rec['cfg'] = read_cfg_ids(b) if p else None
         rec['idx'] = rec['smi']['index'] if rec['smi'] else (rec['nvml']['index'] if rec['nvml'] else None)
         gpus.append(rec)
@@ -1342,42 +1527,70 @@ def assemble_gpus(ctx):
 # 判定
 # ============================================================================
 
-def expect_check(db, expect):
-    fam, form, sku = db['family'], db['form'], db['sku']
-    if expect == 'any':
-        return OK, '硬件识别为 %s' % sku
-    if fam == 'H100':
-        want = {'h100-sxm': ('SXM', 'SXM5'), 'h100-pcie': ('PCIe', 'PCIe'), 'h100-nvl': ('NVL', 'NVL')}.get(expect)
-        if want and not form.startswith(want[0]):
-            return FAIL, '实为 %s，与期望的 H100 %s 版不符' % (sku, want[1])
-        return OK, '硬件识别为 %s' % sku
-    if fam in ('H20', 'H800'):
-        return FAIL, '实为 %s，不是 H100 —— %s' % (sku, db['note'])
-    if fam in ('H200', 'GH200'):
-        return WARN, '实为 %s，不是 H100（规格高于 H100）' % sku
-    if fam == 'GH100?':
-        return WARN, '设备 ID 属于 GH100 但%s' % db['note'].replace('未命名的 GH100 设备 ID，', '')
-    return FAIL, '实为 %s，不是 H100' % sku
+def parse_expect(text):
+    """--expect 参数 → None（不限型号）、dict(key, form, fam, label)，无法识别时返回 False"""
+    t = (text or '').strip()
+    if t.lower() in ('any', 'all', '*', ''):
+        return None
+    form = None
+    m = re.match(r'^(.+?)[-_ ]?(sxm\d?|pcie|nvl)$', t, re.I)
+    if m:
+        t, form = m.group(1), {'S': 'SXM', 'P': 'PCIE', 'N': 'NVL'}[m.group(2)[0].upper()]
+    key = model_key(t) or model_key('RTX ' + t)
+    if not key or key not in KNOWN_KEYS:
+        return False
+    fam = next((d['family'] for d in GPU_DB.values() if d['family'].upper() == key), key)
+    label = fam
+    if form:
+        forms = Counter(d['form'] for d in GPU_DB.values() if key in db_keys(d) and d['form'].upper().startswith(form))
+        if not forms:
+            return False
+        label = '%s %s' % (fam, forms.most_common(1)[0][0])
+    return dict(key=key, form=form, fam=fam, label=label)
 
 
-def evaluate_gpu(g, expect):
+def expect_check(db, exp):
+    sku, note = db['sku'], db['note']
+    via = '（型号库中没有该设备 ID，按本机 pci.ids 识别）' if db.get('src') == 'pci.ids' else ''
+    if exp is None:
+        return OK, '硬件识别为 %s%s' % (sku, via)
+    keys = db_keys(db)
+    if exp['key'] in keys:
+        if exp['form'] and not db['form'].upper().startswith(exp['form']):
+            return FAIL, '实为 %s，与期望的 %s 版不符' % (sku, exp['label'])
+        return OK, '硬件识别为 %s%s' % (sku, via)
+    if exp['key'] == 'H100':
+        if db['family'] == 'GH100?':
+            return WARN, '设备 ID 属于 GH100 但%s' % note.replace('未命名的 GH100 设备 ID，', '')
+        if db['family'] in ('H200', 'GH200'):
+            return WARN, '实为 %s，不是 H100（规格高于 H100）' % sku
+    return FAIL, '实为 %s，不是 %s%s' % (sku, exp['fam'], (' —— ' + note) if note else '')
+
+
+CRITICAL = ('hwid', 'cfg', 'names', 'swid', 'smi_nvml', 'sm', 'bus', 'mem', 'arch', 'es')
+ARCH_WORDS = ('pascal', 'volta', 'turing', 'ampere', 'ada', 'hopper', 'blackwell')
+
+
+def evaluate_gpu(g, target):
     checks = []
 
-    def add(key, level, value, detail=''):
-        checks.append(dict(key=key, level=level, value=value, detail=detail))
+    def add(key, level, value, detail='', crit=None):
+        checks.append(dict(key=key, level=level, value=value, detail=detail,
+                           crit=(key in CRITICAL) if crit is None else crit))
 
     p, db, smi, nv, pr, cu = g['pci'], g['db'], g['smi'], g['nvml'], g['proc'], g['cuda']
     devid = g['devid']
-    hwfam = db['family'] if db else None
+    keys = db_keys(db)
     mig = smi and smi.get('mig') == 'Enabled'
 
     # 1. 硬件设备 ID（PCI 配置空间，芯片熔丝决定）
     if p is None:
         add('hwid', WARN, '-', 'sysfs 中找不到该 GPU 的 PCI 设备，无法做硬件 ID 核验')
     elif db is None:
-        add('hwid', WARN, '0x%04x' % devid, '设备 ID 0x%04x 不在内置型号库中（可能是工程样品或新型号）' % devid)
+        add('hwid', WARN, '0x%04x' % devid, '设备 ID 0x%04x 不在内置型号库中，本机 pci.ids 也无法识别（可能是工程样品或新型号）'
+            % devid)
     else:
-        lvl, why = expect_check(db, expect)
+        lvl, why = expect_check(db, target)
         add('hwid', lvl, '0x%04x' % devid, why)
     # 2. 实时配置空间 vs 内核缓存值
     cfg = g['cfg']
@@ -1393,13 +1606,16 @@ def evaluate_gpu(g, expect):
     names = [(src, nm) for src, nm in srcs if nm]
     if not names:
         add('names', WARN, '无数据', '驱动未加载或 nvidia-smi/NVML 不可用，只完成了硬件 ID 核验')
-    elif hwfam in KNOWN_FAMILIES:
-        bad = ['%s 报告“%s”' % (src, nm) for src, nm in names if family_of(nm) != hwfam]
+    elif keys:
+        bad = ['%s 报告“%s”' % (src, nm) for src, nm in names if model_key(nm) and model_key(nm) not in keys]
+        unk = ['%s 报告“%s”' % (src, nm) for src, nm in names if not model_key(nm)]
         if bad:
             add('names', FAIL, '不一致', '型号名称与硬件 ID（%s）不符：%s —— 疑似 nvidia-smi/驱动被篡改'
                 % (db['sku'], '；'.join(bad)))
+        elif unk:
+            add('names', WARN, '无法识别', '无法从名称识别型号，未能与硬件 ID（%s）比对：%s' % (db['sku'], '；'.join(unk)))
         else:
-            add('names', OK, '一致', '、'.join(src for src, _ in names) + ' 均为 ' + hwfam)
+            add('names', OK, '一致', '、'.join(src for src, _ in names) + ' 均为 ' + db['family'])
     else:
         add('names', INFO, '-', '名称：' + '；'.join('%s=%s' % x for x in names))
     for src, nm in names:
@@ -1431,12 +1647,13 @@ def evaluate_gpu(g, expect):
         if bad:
             add('swid', FAIL, '不一致', '软件上报的 PCI ID 与硬件 0x%04x 不符：%s —— 疑似篡改'
                 % (p['device'], '；'.join(bad)))
-    # 5. SM 数（NVML 核心数/128，或 --cuda 的 SM 数）
+    # 5. SM 数（NVML 核心数 ÷ 每 SM 核心数（由计算能力决定），或 --cuda 读到的 SM 数）
     sm, sm_src = None, None
+    cps = cores_per_sm((nv and nv.get('cc')) or (db and db.get('cc')))
     if cu and cu.get('sm') and not mig:
         sm, sm_src = cu['sm'], 'CUDA'
-    elif nv and nv.get('cores') and db and db['arch'] == 'Hopper':
-        sm, sm_src = nv['cores'] // 128, 'NVML'
+    elif nv and nv.get('cores') and cps:
+        sm, sm_src = nv['cores'] // cps, 'NVML'
     exp = db and db.get('sms')
     if sm is None:
         add('sm', INFO, '-', '驱动未提供 SM 数（可加 --cuda 读取）')
@@ -1462,27 +1679,36 @@ def evaluate_gpu(g, expect):
     mib_smi = smi and smi.get('mem_total')
     mib = mib_nv or mib_smi
     exp = db and db.get('mem')
+    exps = exp if isinstance(exp, tuple) else ((exp,) if exp else ())
     if not mib:
         add('mem', INFO, '-', '')
     else:
         gib = mib / 1024.0
-        if not exp:
-            add('mem', INFO, '%.1fGiB' % gib, '')
-        elif abs(gib - exp) / float(exp) <= 0.06:
-            add('mem', OK, '%.1fGiB' % gib, '')
+        val = '%.1fGiB' % gib
+        std = '/'.join(str(e) for e in exps)
+        # GDDR 显存开 ECC 时要占掉 1/16 容量，两种值都算标准
+        if not exps:
+            add('mem', INFO, val, '')
+        elif any(abs(gib - e) / float(e) <= 0.06 or abs(gib - e * 15 / 16.0) / (e * 15 / 16.0) <= 0.03 for e in exps):
+            add('mem', OK, val, '')
+        elif db['tier'] != 'dc' and gib > max(exps) * 1.2:
+            g['memmod'] = int(round(gib))
+            add('mem', WARN, val, '显存 %.1f GiB，%s 官方规格为 %s GB —— 大于官方规格，疑似改装大显存（魔改卡），'
+                '芯片为真但板卡非原厂设计，注意稳定性与保修' % (gib, db['sku'], std), crit=False)
         else:
-            add('mem', FAIL, '%.1fGiB' % gib, '显存 %.1f GiB 与 %s 标称 %d GB 不符' % (gib, db['sku'], exp))
+            add('mem', FAIL if db['strict'] else WARN, val, '显存 %.1f GiB 与 %s 标称 %s GB 不符' % (gib, db['sku'], std))
     # 8. 最大功耗墙（VBIOS 决定）
     p_nv, p_smi = nv and nv.get('power_max'), smi and smi.get('power_max')
     pmax = p_nv or p_smi
     exp = db and db.get('maxw')
+    exps = exp if isinstance(exp, tuple) else ((exp,) if exp else ())
     if not pmax:
         add('power', INFO, '-', '')
-    elif not exp or abs(pmax - exp) <= exp * 0.03:
-        add('power', OK if exp else INFO, '%dW' % pmax, '')
+    elif not exps or any(abs(pmax - e) <= e * 0.03 for e in exps):
+        add('power', OK if exps else INFO, '%dW' % pmax, '')
     else:
-        add('power', WARN, '%dW' % pmax, '最大功耗墙 %d W 与 %s 标准值 %d W 不符（VBIOS 非标准或型号不符）'
-            % (pmax, db['sku'], exp))
+        add('power', WARN, '%dW' % pmax, '最大功耗墙 %d W 与 %s 标准值 %s W 不符（VBIOS 非标准或型号不符）'
+            % (pmax, db['sku'], '/'.join(str(e) for e in exps)))
     # 9. 最大频率
     msm = (nv and nv.get('max_sm')) or (smi and smi.get('max_sm'))
     mmem = (nv and nv.get('max_mem')) or (smi and smi.get('max_mem'))
@@ -1535,30 +1761,35 @@ def evaluate_gpu(g, expect):
             add('partno', WARN, pn, 'GPU 部件号 %s 与硬件设备 ID 0x%04x 不对应' % (pn, devid))
         else:
             add('partno', OK, pn, '')
-    # 12. 架构 / 计算能力
-    if db and db['arch'] == 'Hopper':
+    # 12. 架构 / 计算能力（主版本号）
+    if db and db.get('arch'):
         bad = []
-        if smi and smi.get('arch') and smi['arch'].lower() != 'hopper':
-            bad.append('nvidia-smi 架构=%s' % smi['arch'])
+        sa = (smi and smi.get('arch') or '').strip()
+        w = sa.split()[0].lower() if sa else ''
+        if w in ARCH_WORDS and w != db['arch'].split()[0].lower():
+            bad.append('nvidia-smi 架构=%s' % sa)
+        want = (db.get('cc') or '').split('.')[0]
         for src, rec in (('NVML', nv), ('CUDA', cu)):
-            if rec and rec.get('cc') and not rec['cc'].startswith('9.'):
+            if want and rec and rec.get('cc') and rec['cc'].split('.')[0] != want:
                 bad.append('%s 计算能力=%s' % (src, rec['cc']))
         if bad:
-            add('arch', FAIL, '不一致', 'Hopper 芯片却上报 %s —— 疑似篡改' % '；'.join(bad))
+            add('arch', FAIL, '不一致', '%s 芯片却上报 %s —— 疑似篡改' % (db['arch'], '；'.join(bad)))
 
     g['checks'] = checks
     by = dict((c['key'], c) for c in checks)
-    critical = [c for c in checks if c['key'] in ('hwid', 'cfg', 'names', 'swid', 'smi_nvml', 'sm', 'bus', 'mem',
-                                                   'arch', 'es')]
-    worst_crit = max([c['level'] for c in critical] or [OK])
+    worst_crit = max([c['level'] for c in checks if c['crit']] or [OK])
     worst_all = max([c['level'] for c in checks] or [OK])
     short = db['sku'].rsplit(' ', 1)[0] if db and re.search(r'\d+GB$', db['sku']) else (db['sku'] if db else '?')
-    if by.get('hwid', {}).get('level') == FAIL:
-        g['verdict'] = (FAIL, ('形态不符: ' if hwfam == 'H100' else '非H100: ') + (short if db else '?'))
+    hw_lvl = by.get('hwid', {}).get('level')
+    other = target is not None and target['key'] not in keys     # 识别出的型号与期望不同
+    if hw_lvl == FAIL:
+        g['verdict'] = (FAIL, ('非%s: ' % target['fam'] if other else '形态不符: ') + short)
     elif worst_crit == FAIL:
         g['verdict'] = (FAIL, '存疑: 数据矛盾')
     elif worst_crit == WARN:
-        g['verdict'] = (WARN, '待确认' if hwfam != 'H200' and hwfam != 'GH200' else '非H100: ' + short)
+        g['verdict'] = (WARN, '非%s: %s' % (target['fam'], short) if (hw_lvl == WARN and other and keys) else '待确认')
+    elif g.get('memmod'):
+        g['verdict'] = (WARN, '真 %s(改装%dG显存)' % (short, g['memmod']))
     elif worst_all >= WARN:
         g['verdict'] = (WARN, '真 %s(有告警)' % short)
     else:
@@ -1573,7 +1804,7 @@ def evaluate(ctx, args):
     pci = ctx['pci']
     for g in gpus:
         try:
-            evaluate_gpu(g, args.expect)
+            evaluate_gpu(g, args.exp)
         except Exception as e:
             ERRORS.append('GPU %s 判定：%s: %s' % (g.get('idx'), type(e).__name__, e))
             g.setdefault('checks', [dict(key='hwid', level=WARN, value='-', detail='判定出错')])
@@ -1689,7 +1920,7 @@ def evaluate(ctx, args):
         if len(sxm) == 8 and len(nvsw) not in (0, 4) and any(g['db']['family'] == 'H100' for g in sxm):
             F('NVLink', WARN, 'HGX H100 8 卡应有 4 颗 NVSwitch，实际看到 %d 颗' % len(nvsw))
     topo = ctx['topo']
-    if topo['ok'] and sxm:
+    if topo['ok'] and sxm and nvsw:     # 无 NVSwitch 的机型（如 DGX-1 混合立方网格、4 卡直连）本来就不是两两全互联
         labels = ['GPU%d' % g['idx'] for g in sxm if g['idx'] is not None]
         want = sxm[0]['db'].get('links')
         badp = []
@@ -1734,7 +1965,8 @@ def evaluate(ctx, args):
             F('PCIe', WARN, '%s（%s）PCIe 降级：当前 %s，能力 %s' % (h['dev'], h['model'], h['link'], h['link_max']))
     if len(rates) > 1:
         F('IB/RDMA', WARN, 'IB 端口速率不一致：%s' % '，'.join('%s x%d' % kv for kv in rates.most_common()))
-    if hcas and gpus and not ({'nvidia_peermem', 'nv_peer_mem'} & ctx['modules']):
+    pro = [g for g in gpus if not (g['db'] and g['db']['tier'] == 'gf')]    # GeForce 不支持 GPUDirect RDMA
+    if hcas and pro and not ({'nvidia_peermem', 'nv_peer_mem'} & ctx['modules']):
         F('IB/RDMA', INFO, '未加载 nvidia_peermem 模块（GPUDirect RDMA 需要；使用 DMA-BUF 方案可忽略）')
 
     # ---------------- PCIe（GPU）
@@ -1756,40 +1988,47 @@ def evaluate(ctx, args):
     for bdf3, code in ctx['xid'].get('xid', []):
         xid_by.setdefault(bdf3, []).append(code)
     ctx['xid_by'] = xid_by
+    hb = {}     # 同样的问题出现在多张卡上时合并成一条：(级别, 文案) → [GPU 编号]
+
+    def H(level, i, msg):   # msg 里的 {G} 代表 GPU 编号
+        hb.setdefault((level, msg), []).append(i)
+
     for g in gpus:
         d, i = g['smi'], g['idx']
         if not d:
             continue
-        if d.get('ecc') == 'Disabled':
-            F('GPU健康', WARN, 'GPU %s 的 ECC 已关闭' % i)
+        if d.get('ecc') == 'Disabled' and g['db'] and g['db']['tier'] == 'dc':
+            H(WARN, i, '{G} 的 ECC 已关闭（数据中心卡默认开启，关闭后显存位翻转无法发现和纠正）')
         if d.get('ecc_vol_unc'):
-            F('GPU健康', WARN, 'GPU %s 本次启动后出现 %d 个不可纠正 ECC 错误' % (i, d['ecc_vol_unc']))
+            H(WARN, i, '{G} 本次启动后出现 %d 个不可纠正 ECC 错误' % d['ecc_vol_unc'])
         if d.get('ecc_agg_unc'):
-            F('GPU健康', INFO, 'GPU %s 累计不可纠正 ECC 错误 %d 个（历史值）' % (i, d['ecc_agg_unc']))
+            H(INFO, i, '{G} 累计不可纠正 ECC 错误 %d 个（历史值）' % d['ecc_agg_unc'])
         if d.get('rr_failure') == 'Yes':
-            F('GPU健康', FAIL, 'GPU %s 行重映射失败（显存故障，建议报修）' % i)
+            H(FAIL, i, '{G} 行重映射失败（显存故障，建议报修）')
         if d.get('rr_pending') == 'Yes':
-            F('GPU健康', WARN, 'GPU %s 有待生效的行重映射（需在维护窗口复位 GPU）' % i)
+            H(WARN, i, '{G} 有待生效的行重映射（需在维护窗口复位 GPU）')
         if d.get('reset_required') == 'Yes' or d.get('drain_reset') == 'Yes':
-            F('GPU健康', WARN, 'GPU %s 驱动建议复位 GPU' % i)
+            H(WARN, i, '{G} 驱动建议复位 GPU')
         if d.get('recovery') and d['recovery'] not in ('None', 'GPU_RECOVERY_ACTION_NONE'):
-            F('GPU健康', WARN, 'GPU %s 驱动建议恢复动作：%s' % (i, d['recovery']))
+            H(WARN, i, '{G} 驱动建议恢复动作：%s' % d['recovery'])
         if d.get('temp') and d['temp'] >= 85:
-            F('GPU健康', WARN, 'GPU %s 核心温度 %d°C 偏高' % (i, d['temp']))
+            H(WARN, i, '{G} 核心温度 %d°C 偏高' % d['temp'])
         if d.get('mem_temp') and d['mem_temp'] >= 90:
-            F('GPU健康', WARN, 'GPU %s 显存温度 %d°C 偏高' % (i, d['mem_temp']))
+            H(WARN, i, '{G} 显存温度 %d°C 偏高' % d['mem_temp'])
         badthr = [THROTTLE_CN.get(t, t) for t in d.get('throttle', []) if t in THROTTLE_BAD]
         if badthr:
-            F('GPU健康', WARN, 'GPU %s 正在降频：%s' % (i, '、'.join(badthr)))
+            H(WARN, i, '{G} 正在降频：%s' % '、'.join(badthr))
         codes = xid_by.get(g['bdf'][:-2], [])
         hard = sorted(set(c for c in codes if c not in XID_APP))
         if hard:
-            F('GPU健康', WARN, 'GPU %s 内核日志有 Xid %s' % (i, '、'.join(
-                '%d(%s)' % (c, XID_DESC.get(c, '见 NVIDIA Xid 文档')) for c in hard)))
+            H(WARN, i, '{G} 内核日志有 Xid %s' % '、'.join(
+                '%d(%s)' % (c, XID_DESC.get(c, '见 NVIDIA Xid 文档')) for c in hard))
         elif codes:
-            F('GPU健康', INFO, 'GPU %s 内核日志有应用类 Xid %s' % (i, '、'.join(str(c) for c in sorted(set(codes)))))
+            H(INFO, i, '{G} 内核日志有应用类 Xid %s' % '、'.join(str(c) for c in sorted(set(codes))))
         if g['cfg'] and g['cfg']['vendor'] == 0xffff:
-            F('GPU健康', FAIL, 'GPU %s PCI 配置空间无响应（掉卡？）' % i)
+            H(FAIL, i, '{G} PCI 配置空间无响应（掉卡？）')
+    for (lvl, msg), ids in hb.items():
+        F('GPU健康', lvl, msg.replace('{G}', 'GPU ' + compress_ids(ids)))
     if not ctx['xid']['ok']:
         F('GPU健康', INFO, '未检查 Xid：%s' % ctx['xid']['error'])
 
@@ -1806,13 +2045,18 @@ def render(ctx, args, elapsed):
     rep = Report()
     st = ctx['sys']
     W = 108
+    title, ver = '  GPU 服务器检测报告', 'h100_check v' + VERSION
     rep.add(bold('=' * W))
-    rep.add(bold('  H100 GPU 服务器检测报告') + ' ' * (W - 40) + dim('h100_check v' + VERSION))
+    rep.add(bold(title) + ' ' * max(1, W - dwidth(title) - len(ver)) + dim(ver))
     rep.add(bold('=' * W))
     rep.add('  主机: %s    时间: %s    用户: %s    耗时: %.1fs'
             % (st['hostname'], time.strftime('%Y-%m-%d %H:%M:%S %Z'), 'root' if G.is_root else '非 root', elapsed))
     rep.add('  模式: 只读（不创建 CUDA 上下文 / 不占显存 / 不跑负载 / 不改任何配置），nice 19 + ionice idle'
             + ('；已启用 --cuda 设备属性查询（无上下文）' if args.cuda else ''))
+    exp = args.exp
+    rep.add('  核验目标: %s（--expect %s）' % (
+        '不限型号，只检查各数据源是否一致、规格是否与识别出的型号吻合' if exp is None else
+        exp['label'] + ('，任意形态均可' if not exp['form'] and exp['key'] == 'H100' else ''), args.expect))
     if not G.is_root:
         rep.add('  ' + yellow('提示: 非 root 运行，内存条、整机序列号、网卡料号、内核日志等信息可能缺失'))
 
@@ -1874,7 +2118,9 @@ def render_hw(rep, ctx):
         pop = [d for d in dimms if _size_gb(d.get('Size')) not in (None, 0)]
         dimm_txt = '%d / %d 槽位已插' % (len(pop), len(dimms))
     else:
-        pop, dimm_txt = [], '(需 root 运行 dmidecode)'
+        pop = []
+        dimm_txt = '(%s%s)' % (mem.get('dimm_note') or '无数据',
+                               '；容器内一般读不到 SMBIOS，请在宿主机上运行' if ctx['sys'].get('container') else '')
     rep.kv([
         ('CPU 型号', s(cpu['model'])),
         ('路数 / 核数 / 线程', '%s 路 / %s 核 / %s 线程' % (s(cpu['sockets']), s(cpu['cores']), s(cpu['threads']))),
@@ -1924,9 +2170,9 @@ def render_gpu_list(rep, ctx):
         p, d = g['pci'] or {}, g['smi'] or {}
         name = d.get('name') or (g['nvml'] or {}).get('name') or (g['db']['sku'] if g['db'] else '-')
         mem = '%d MiB' % d['mem_total'] if d.get('mem_total') else '-'
-        pw = '%s/%sW' % (s(d.get('power_limit') and int(d['power_limit'])), s(d.get('power_max') and int(d['power_max']))) \
+        pw = '%s/%sW' % (iv(d.get('power_limit')), iv(d.get('power_max'))) \
             if d.get('power_max') else '-'
-        clk = '%s/%s' % (s(d.get('max_sm') and int(d['max_sm'])), s(d.get('max_mem') and int(d['max_mem']))) \
+        clk = '%s/%s' % (iv(d.get('max_sm')), iv(d.get('max_mem'))) \
             if d.get('max_sm') else '-'
         rows.append([s(g['idx']), short_bdf(g['bdf']), clip(name, 26), mem, pw, clk,
                      fmt_link(p.get('max_speed'), p.get('max_width')), s(p.get('numa') if p.get('numa', -1) >= 0 else None),
@@ -1946,7 +2192,7 @@ def render_gpu_list(rep, ctx):
 
 def render_authenticity(rep, ctx, args):
     gpus = ctx['gpus']
-    rep.section('四、H100 真伪核验')
+    rep.section('四、GPU 型号与真伪核验' if args.exp is None else '四、%s 真伪核验' % args.exp['label'])
     rows = []
     for g in gpus:
         by = dict((c['key'], c) for c in g['checks'])
@@ -1966,6 +2212,11 @@ def render_authenticity(rep, ctx, args):
     if rows:
         rep.table(['GPU', 'PCI', '硬件ID', '硬件识别型号', '名称一致', 'SM', '显存位宽', '显存', '功耗墙',
                    '最大频率', 'NVLink', '结论'], rows, aligns='r')
+    via = [g for g in gpus if g['db'] and g['db'].get('src') == 'pci.ids']
+    if via:
+        rep.note('GPU %s 的设备 ID（%s）不在内置型号库中，型号按本机 pci.ids 识别，并与驱动/NVML/nvidia-smi 报告的名称核对；'
+                 '没有标准规格可比，可信度低于内置型号。' % (compress_ids([g['idx'] for g in via]),
+                                                  '、'.join(sorted(set('0x%04x' % g['devid'] for g in via)))))
     # 异常明细
     bad = [f for f in Findings.items if f[0] == '真伪' and f[1] >= WARN]
     if bad:
@@ -2021,7 +2272,7 @@ def render_authenticity(rep, ctx, args):
     rep.table(['检查项', '结果', '说明'], rows)
     rep.note('判定方法（全部只读，多层交叉验证）：\n'
              '  1) 硬件层：PCI 配置空间里的设备 ID 由 GPU 芯片熔丝决定，改名/改标签/改 nvidia-smi 都改不了；\n'
-             '     H100 SXM5=0x2330、H100 PCIe=0x2331、H100 NVL=0x2321，而 H20=0x2329、H800=0x2324；\n'
+             '     例：H100 SXM5=0x2330、H100 PCIe=0x2331，而 H20=0x2329、H800=0x2324；RTX 4090=0x2684，4090 D=0x2685；\n'
              '  2) 驱动层：/proc 驱动型号、NVML 直连（绕过 nvidia-smi 程序）、nvidia-smi 三者都必须与硬件 ID 一致；\n'
              '  3) 规格指纹：SM 数、显存位宽、显存容量、功耗墙、最大频率、NVLink 链路数与该型号标准值比对；\n'
              '  4) 工具链：nvidia-smi 是否原厂 ELF、包管理器校验、驱动各组件版本一致性、LD_PRELOAD 劫持。\n'
@@ -2191,9 +2442,9 @@ def render_health(rep, ctx):
         d, p = g['smi'], g['pci'] or {}
         if not d:
             continue
-        temp = '%s/%s' % (s(d.get('temp') and int(d['temp'])), s(d.get('mem_temp') and int(d['mem_temp'])))
-        pw = '%s/%sW' % (s(d.get('power_draw') and int(d['power_draw'])), s(d.get('power_limit') and int(d['power_limit'])))
-        mem = '%s/%s' % (s(d.get('mem_used') and int(d['mem_used']), '0'), s(d.get('mem_total') and int(d['mem_total'])))
+        temp = '%s/%s' % (iv(d.get('temp')), iv(d.get('mem_temp')))
+        pw = '%s/%sW' % (iv(d.get('power_draw')), iv(d.get('power_limit')))
+        mem = '%s/%s' % (iv(d.get('mem_used'), '0'), iv(d.get('mem_total')))
         unc = '%s/%s' % (s(d.get('ecc_vol_unc')), s(d.get('ecc_agg_unc')))
         unc = lv_cell(WARN, unc) if d.get('ecc_vol_unc') else unc
         rr = '待处理' if d.get('rr_pending') == 'Yes' else ('失败' if d.get('rr_failure') == 'Yes' else '正常')
@@ -2202,7 +2453,7 @@ def render_health(rep, ctx):
         thr_txt = lv_cell(WARN, ','.join(thr)) if any(t in THROTTLE_BAD for t in d.get('throttle', [])) else (','.join(thr) or '-')
         codes = (ctx.get('xid_by') or {}).get(g['bdf'][:-2], [])
         xid = ','.join('%d' % c for c in sorted(set(codes))) if codes else ('0' if ctx['xid']['ok'] else '-')
-        rows.append(['GPU%s' % g['idx'], temp, pw, '%s%%' % s(d.get('util') and int(d['util']), '0'), mem,
+        rows.append(['GPU%s' % g['idx'], temp, pw, '%s%%' % iv(d.get('util'), '0'), mem,
                      str(d.get('procs', 0)), fmt_link(p.get('cur_speed'), p.get('cur_width')), s(d.get('ecc')), unc,
                      rr, thr_txt, lv_cell(WARN, xid) if codes else xid])
     rep.table(['GPU', '温度 核心/显存', '功耗 当前/墙', '利用率', '显存 已用/总(MiB)', '进程', 'PCIe 当前', 'ECC',
@@ -2357,8 +2608,9 @@ def collect_all(args):
     ctx['ib'] = safe('IB 网卡', collect_ib, [], ctx['pci'])
     rdma_netdevs = set(n for h in ctx['ib'] for n in h['netdevs'])
     ctx['eth'] = safe('网卡', collect_eth, ([], 0), ctx['pci'], rdma_netdevs)
-    if any(n['vendor'] != 0x15b3 for n in ctx['eth'][0]):
-        ctx['lspci'] = safe('lspci', lspci_names, {})
+    unknown_gpu = any(is_nv_gpu(p) and p.get('device') not in GPU_DB for p in ctx['pci'].values())
+    if unknown_gpu or any(n['vendor'] != 0x15b3 for n in ctx['eth'][0]):
+        ctx['lspci'] = safe('lspci', lspci_names, {})      # 型号库里没有的 GPU 用本机 pci.ids 兜底识别
     ctx['ofed'] = safe('OFED', collect_ofed, {})
     step('内核日志 Xid')
     ctx['xid'] = safe('Xid', collect_xid, {'ok': False, 'xid': [], 'sxid': 0, 'error': '解析出错'})
@@ -2370,11 +2622,14 @@ def collect_all(args):
 def parse_args():
     ap = argparse.ArgumentParser(
         prog='h100_check.py',
-        description='H100 GPU 服务器只读检测：硬件清单、IB 网卡、NVLink 拓扑、H100 真伪核验（不影响线上业务）。',
-        epilog='退出码：0=通过 1=有告警 2=真伪不通过（非 H100 或疑似篡改） 3=运行错误')
+        description='GPU 服务器只读检测：硬件清单、IB 网卡、NVLink 拓扑、GPU 型号真伪核验（重点防 H20/H800 冒充 H100；'
+                    '不影响线上业务）。',
+        epilog='退出码：0=通过 1=有告警 2=真伪不通过（不是期望的型号，或疑似篡改） 3=运行错误')
     ap.add_argument('-o', '--output', metavar='FILE', help='同时把报告（无颜色）保存到文件')
-    ap.add_argument('--expect', default='h100', choices=['h100', 'h100-sxm', 'h100-pcie', 'h100-nvl', 'any'],
-                    help='期望的 GPU 型号（默认 h100，任意 H100 形态均可；h100-sxm 则 PCIe 版也判不通过；any 只做一致性检查）')
+    ap.add_argument('--expect', default='h100', metavar='型号',
+                    help='期望的 GPU 型号，默认 h100（任意 H100 形态均可）。可加形态后缀 -sxm/-pcie/-nvl，如 h100-sxm、'
+                         'a100-sxm；也可以是其它型号，如 h20、a800、l40s、l20、4090、4090d、5090、a6000、6000ada；'
+                         'any 表示不限型号，只做一致性检查')
     ap.add_argument('--expect-gpus', type=int, metavar='N', help='期望的 GPU 数量（HGX 8 卡机型默认按 8 检查）')
     ap.add_argument('--cuda', action='store_true',
                     help='额外通过 CUDA 驱动 API 读取 SM 数/L2 等属性（只调用 cuInit 与属性查询，不创建上下文、不占显存）')
@@ -2391,6 +2646,11 @@ def parse_args():
 def main():
     setup_stdio()
     args = parse_args()
+    args.exp = parse_expect(args.expect)
+    if args.exp is False:
+        sys.stderr.write('h100_check: 无法识别 --expect %s。示例：h100、h100-sxm、h20、a100、a800-sxm、l40s、l20、4090、'
+                         '4090d、5090、a6000、6000ada、any（不限型号）\n' % args.expect)
+        return 3
     G.sysroot = (args.sysroot or '').rstrip('/')
     G.test_mode = bool(G.sysroot)
     if not G.test_mode and not sys.platform.startswith('linux'):

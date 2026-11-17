@@ -1,6 +1,6 @@
-# h100_check — H100 GPU 服务器只读检测
+# h100_check — GPU 服务器只读检测（重点：H100 真伪核验）
 
-单文件脚本 `h100_check.py`，只用 Python 3.6+ 标准库，不需要 pip 安装任何东西。它在 GPU 服务器上收集硬件配置，在终端输出表格报告，重点核验 GPU 是否为真 H100（能识别 H20 / H800 冒充）。
+单文件脚本 `h100_check.py`，只用 Python 3.6+ 标准库，不需要 pip 安装任何东西。它在 GPU 服务器上收集硬件配置，在终端输出表格报告，重点核验 GPU 是否为真 H100（能识别 H20 / H800 冒充）。也能识别其它主流 GPU（A100/A800、L40S/L20、RTX 4090/4090 D、RTX 5090 等，见「支持的型号」），核验型号是否与期望一致。
 
 **检测全程只读，不影响线上业务**：不创建 CUDA 上下文、不占显存、不跑任何负载或带宽测试、不重置计数器、不改任何配置。详见下面的「对线上业务的影响」一节。
 
@@ -18,33 +18,47 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/main/run.sh | sud
 curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/main/run.sh | sudo bash -s -- --expect h100-sxm -o /tmp/h100_report.txt
 ```
 
+不是 H100 的机器，用 `--expect` 指定期望型号，或用 `--expect any` 只做一致性检查：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/main/run.sh | sudo bash -s -- --expect 4090
+```
+
 `run.sh` 只做三件事：找到 Python 3.6+，把 `h100_check.py` 下载到内存并检查是否完整，再交给 Python 执行。除了 `-o` 指定的报告文件，不在磁盘上留任何东西。不加 `sudo` 也能跑，但会缺少内存条型号、网卡序列号和料号，以及 dmesg 里的 Xid 记录。
 
 要固定版本、不受仓库后续更新影响，就直接运行打了标签的版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/v1.0.0/h100_check.py | sudo python3 -
+curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/v1.1.0/h100_check.py | sudo python3 -
 ```
 
 ### 服务器访问不了 GitHub 时
 
-国内机房经常连不上 `raw.githubusercontent.com`。可以在能上网的机器上下载一次，再通过 ssh 管道执行。目标机不需要外网，也不会留下文件：
+国内机房经常连不上 `raw.githubusercontent.com`，有三种办法：
 
-```bash
-curl -fsSLO https://raw.githubusercontent.com/rivia7/h100-check/main/h100_check.py
-ssh gpu-node 'sudo python3 - --no-color' < h100_check.py > gpu-node.txt
+1. **用中转站**（推荐，见下面「自建中转」一节）。在 GPU 服务器上：
 
-# 批量检查，按退出码汇总
-for h in node01 node02 node03; do
-  ssh "$h" 'sudo python3 - --no-color' < h100_check.py > "report-$h.txt"; echo "$h rc=$?"
-done
-```
+   ```bash
+   curl -fsSL http://<中转站>/h100/run.sh | sudo bash
+   ```
 
-也可以把 `run.sh` 和 `h100_check.py` 放到内网 HTTP 服务器上，用 `H100_CHECK_URL` 指定脚本地址：
+2. **ssh 管道**：在能上网的机器上下载一次，再通过 ssh 管道执行。目标机不需要外网，也不会留下文件：
 
-```bash
-curl -fsSL http://<内网地址>/run.sh | sudo env H100_CHECK_URL=http://<内网地址>/h100_check.py bash
-```
+   ```bash
+   curl -fsSLO https://raw.githubusercontent.com/rivia7/h100-check/main/h100_check.py
+   ssh gpu-node 'sudo python3 - --no-color' < h100_check.py > gpu-node.txt
+
+   # 批量检查，按退出码汇总
+   for h in node01 node02 node03; do
+     ssh "$h" 'sudo python3 - --no-color' < h100_check.py > "report-$h.txt"; echo "$h rc=$?"
+   done
+   ```
+
+3. **内网 HTTP 服务器**：把 `h100_check.py` 放在 `<地址>/main/h100_check.py`，用 `H100_CHECK_BASE` 指定根地址（或用 `H100_CHECK_URL` 直接指定脚本的完整地址）：
+
+   ```bash
+   curl -fsSL http://<内网地址>/main/run.sh | sudo env H100_CHECK_BASE=http://<内网地址> bash
+   ```
 
 ## 参数
 
@@ -52,7 +66,8 @@ curl -fsSL http://<内网地址>/run.sh | sudo env H100_CHECK_URL=http://<内网
 |---|---|
 | `-o FILE` | 把报告另存一份到文件（不含颜色码） |
 | `--expect h100` | 默认值。H100 的任何形态（SXM5 / PCIe / NVL）都算通过 |
-| `--expect h100-sxm` | 必须是 SXM5 版，PCIe/NVL 版判为「形态不符」。也可用 `h100-pcie`、`h100-nvl` |
+| `--expect h100-sxm` | 必须是 SXM5 版，PCIe/NVL 版判为「形态不符」。也可用 `h100-pcie`、`h100-nvl`，其它型号同理（如 `a100-sxm`） |
+| `--expect <型号>` | 期望其它型号，如 `h20`、`a100`、`a800`、`l40s`、`l20`、`4090`、`4090d`、`5090`、`a6000`、`6000ada`。大小写、空格、`rtx` 前缀都可省略 |
 | `--expect any` | 不限型号，只检查各数据源是否一致、规格是否与识别出的型号吻合（比如用来检查 H20 机器本身是否正常） |
 | `--expect-gpus N` | 期望的 GPU 张数。HGX 8 卡机型（4 颗 NVSwitch）会自动按 8 张检查 |
 | `--cuda` | 额外通过 CUDA 驱动 API 读取 SM 数、显存位宽等属性，多一路交叉验证。只调用 `cuInit` 和属性查询，不创建上下文、不占显存。默认关闭 |
@@ -62,10 +77,10 @@ curl -fsSL http://<内网地址>/run.sh | sudo env H100_CHECK_URL=http://<内网
 
 | 退出码 | 含义 |
 |---|---|
-| 0 | 通过：GPU 确认为真 H100，没有健康或配置问题 |
-| 1 | 有告警：GPU 是真的，但有健康/配置问题（NVLink 掉链、IB 端口 down、Xid、ECC 等）；或真伪暂时无法确认（如驱动未加载） |
-| 2 | 不通过：GPU 不是 H100（H20/H800 等），或发现数据被篡改的证据 |
-| 3 | 运行错误（非 Linux、找不到 Python 等） |
+| 0 | 通过：GPU 确认为期望的型号，没有健康或配置问题 |
+| 1 | 有告警：GPU 是真的，但有健康/配置问题（NVLink 掉链、IB 端口 down、Xid、ECC、改装显存等）；或真伪暂时无法确认（如驱动未加载） |
+| 2 | 不通过：GPU 不是期望的型号（如期望 H100 实为 H20、期望 4090 实为 4090 D），或发现数据被篡改的证据 |
+| 3 | 运行错误（非 Linux、找不到 Python、`--expect` 型号无法识别等） |
 
 ## 对线上业务的影响
 
@@ -84,7 +99,7 @@ curl -fsSL http://<内网地址>/run.sh | sudo env H100_CHECK_URL=http://<内网
 1. **系统概览**：机型、序列号、BIOS、OS/内核、NVIDIA 驱动（区分开源/闭源内核模块）、CUDA 版本、GSP 固件、Fabric Manager、OFED
 2. **CPU / 内存 / 存储**：CPU 型号与路数、NUMA、内存条型号/速率/槽位、NVMe 盘
 3. **GPU 清单**：型号、显存、功耗墙、最大频率、PCIe 能力、NUMA、VBIOS、序列号、模块号、板卡料号、InfoROM、UUID、持久模式/MIG/ECC
-4. **H100 真伪核验**：每张卡逐项比对硬件 ID 和规格指纹，另有工具链完整性检查（见下节）
+4. **真伪核验**：每张卡逐项比对硬件 ID 和规格指纹，另有工具链完整性检查（见下节）
 5. **NVLink 拓扑**：`nvidia-smi topo -m` 互联矩阵（含 CPU 亲和）、每卡链路激活数/速率/错误计数/未激活链路、通过 NVML 读到的各卡到每颗 NVSwitch 的链路分布、NVSwitch 数量、Fabric Manager 状态
 6. **IB / RDMA 网卡**：型号、料号(PN)、序列号、固件、PSID、PCIe 当前/能力速率、端口状态/速率/LID、链路错误计数，以及每张 GPU 最近的 RDMA 网卡（GPUDirect RDMA 亲和）
 7. **其它网卡**：管理网卡等
@@ -97,10 +112,10 @@ curl -fsSL http://<内网地址>/run.sh | sudo env H100_CHECK_URL=http://<内网
 
 1. **硬件层**：PCI 设备 ID 由 GPU 芯片熔丝决定，改名字、贴标签、改 nvidia-smi 都改不了。脚本既读内核缓存的 ID，也直接读 PCI 配置空间，两者对比。
 2. **驱动层**：`/proc/driver/nvidia` 里的型号、NVML 直连读到的型号和 PCI ID（绕过 nvidia-smi 程序，直接调 `libnvidia-ml.so`）、nvidia-smi 的输出，三者都必须和硬件 ID 对得上；nvidia-smi 和 NVML 报的显存、功耗墙、频率、序列号也要一致。
-3. **规格指纹**：SM 数、显存位宽、显存容量、最大功耗墙、最大频率、NVLink 链路数、计算能力（9.0）、GPU 部件号前缀，与该型号的标准值比对。
+3. **规格指纹**：SM 数（NVML 核心数 ÷ 每 SM 核心数）、显存位宽、显存容量、最大功耗墙、最大频率、NVLink 链路数、架构与计算能力、GPU 部件号前缀，与该型号的标准值比对。
 4. **工具链**：nvidia-smi 是否为原厂 ELF、包管理器校验和是否一致、驱动各组件版本是否一致、`/etc/ld.so.preload` 和 `LD_PRELOAD` 劫持。
 
-关键项（硬件 ID、型号名、SM 数、显存位宽、显存容量、架构、nvidia-smi 与 NVML 一致性）只要有一项不符，就判「不通过」。功耗墙、频率、部件号这类非关键项有偏差时只告警，不影响真伪结论。
+关键项（硬件 ID、型号名、SM 数、显存位宽、显存容量、架构、nvidia-smi 与 NVML 一致性）有矛盾时判「不通过」或「待确认」：H100 SXM5/PCIe 这类参考值可信度高的型号直接判不通过，其它型号先判待确认。功耗墙、频率、部件号这类非关键项有偏差时只告警，不影响真伪结论。
 
 常见设备 ID（来源：pci.ids 与 NVIDIA 驱动 README 的支持列表）：
 
@@ -114,20 +129,74 @@ curl -fsSL http://<内网地址>/run.sh | sudo env H100_CHECK_URL=http://<内网
 | `0x2328` / `0x232c` | **H20B / H20-3e** | 同上 |
 | `0x2324` / `0x2322` / `0x233a` | **H800** SXM5 / PCIe / NVL | 特供版，NVLink 只有 8 条 |
 | `0x2335` / `0x233b` | H200 SXM / NVL | 比 H100 更高规格，判为「非 H100」但不算降级 |
+| `0x20b2` / `0x20f3` | A100 SXM4 80GB / **A800** SXM4 80GB | A800 的 NVLink 为 8 条（A100 为 12 条） |
+| `0x26b9` / `0x26ba` | L40S / **L20** | L20 为特供版 |
+| `0x2684` / `0x2685` | RTX 4090 / **RTX 4090 D** | 4090 D 为特供版，114 个 SM（4090 为 128 个） |
+| `0x2b85` / `0x2b87` / `0x2b8c` | RTX 5090 / **5090 D** / **5090 D V2** | 5090 D V2 只有 24GB、384-bit |
+
+## 支持的型号
+
+内置型号库按设备 ID 收录了约 160 个 ID（`GPU_DB`）：
+
+- **数据中心**：H100 / H800 / H20 / H200 / GH200，B200 / B100 / GB200 / B300 / GB300，A100 / A800 / A30 / A40 / A10 / A10G / A2 / A16，L40S / L40 / L20 / L4 / L2，V100 / V100S / T4 / P100 / P40 / P4
+- **专业卡**：RTX PRO 6000 / 6000D / 5000 Blackwell，RTX 6000 / 5880 / 5000 / 4500 / 4000 / 2000 Ada，RTX A6000 / A5500 / A5000 / A4500 / A4000 / A2000，Quadro RTX 8000 / 6000 / 5000 / 4000
+- **消费级**：GeForce RTX 5090 / 5090 D / 5090 D V2 / 5080 / 5070 Ti / 5070 / 5060 Ti / 5060，RTX 4090 / 4090 D / 4080 SUPER / 4080 / 4070 Ti SUPER / 4070 Ti / 4070 SUPER / 4070 / 4060 Ti / 4060，RTX 3090 Ti / 3090 / 3080 Ti / 3080 / 3070 Ti / 3070 / 3060 Ti / 3060，RTX 2080 Ti / 2080 SUPER / 2080 / 2070 SUPER / 2070 / 2060 SUPER / 2060，TITAN RTX / TITAN V
+
+型号库里没有的设备 ID，会退回用本机的 pci.ids（`lspci`）识别，再与驱动、NVML、nvidia-smi 报告的名称核对，报告里会注明「按本机 pci.ids 识别」，可信度低于内置型号。
+
+不同类型的卡，检查侧重不同：
+
+- **消费级卡**的功耗墙和最大频率随板卡厂商不同，不做比对；ECC 默认关闭属正常，不告警；不支持 GPUDirect RDMA，不提示 `nvidia_peermem`。
+- **改装大显存**（如 48GB 的 RTX 4090、22GB 的 RTX 2080 Ti）：显存明显大于官方规格时，结论为「真 RTX 4090(改装48G显存)」并给出告警。芯片是真的，但板卡不是原厂设计，要留意稳定性和保修。
+- **数据中心卡**关闭 ECC 时告警。GDDR 显存开 ECC 会占掉 1/16 容量，两种容量都按标准处理。
 
 ## 局限
 
 - **内核级伪造防不住**：如果有人改了内核（例如修改开源内核模块，或在 PCI 层伪造设备 ID），所有软件读到的数据都可能是假的。脚本会显示内核模块的 srcversion 和 taint 标志，可与同版本的正常机器比对。
 - **不做算力实测**：要确认实际算力，需要在维护窗口对空闲 GPU 单独压测（比如跑 BF16 GEMM：H100 SXM5 稠密 BF16 理论约 989 TFLOPS，H20 约 148 TFLOPS）。这会占用 GPU，所以脚本有意不做。
-- 规格表里 H20、H800 的部分数值（SM 数、功耗等）以硬件 ID 判定为主，规格只作辅助参考。
-- 脚本目前只在模拟环境里测试过（见下节），还没在真实 H100 机器上跑过。首次使用建议先在一台确定是正品的机器上跑一遍，作为基线对照。
+- 规格表里 H20、H800 的部分数值（SM 数、功耗等）以硬件 ID 判定为主，规格只作辅助参考。新增型号的规格取自官方公开参数，偏差时只告警。
+- H100 检测目前只在模拟环境里测试过（见下节），还没在真实 H100 机器上跑过。首次使用建议先在一台确定是正品的机器上跑一遍，作为基线对照。RTX 4090 的测试场景取自一台真实机器的报告。
+
+## 自建中转
+
+`relay/` 目录是一个 Docker Compose 服务，部署在一台能访问 GitHub 的服务器上，给访问不了 GitHub 的 GPU 服务器提供一键运行入口：
+
+- `sync` 容器每 10 分钟从 GitHub 同步一次 main 分支和所有版本标签。它走 `codeload.github.com` 和 `api.github.com`，不依赖常被墙的 `raw.githubusercontent.com`，只发布末行完整的脚本。
+- `web` 容器（nginx）对外提供 `/h100/` 下的文件。
+- 两个容器共用同一个 nginx 镜像。
+
+`h100_check.py` 与 GitHub 上的文件逐字节一致。只有 `run.sh` 被改写过：默认下载源改成中转站，标签目录里的 `run.sh` 默认运行同一版本。
+
+部署步骤：
+
+```bash
+scp -r relay/ <中转服务器>:/opt/h100-relay
+ssh <中转服务器>
+cd /opt/h100-relay
+cat > .env <<'EOF'
+PUBLIC_BASE=http://<中转服务器公网 IP 或域名>/h100
+NGINX_IMAGE=nginx:1.27-alpine   # Docker Hub 拉不到时换成镜像站，如 mirror.ccs.tencentyun.com/library/nginx:1.27-alpine
+EOF
+docker compose up -d
+curl http://127.0.0.1/h100/     # 使用说明、可用版本、最近同步时间
+```
+
+云服务器还要在控制台的防火墙/安全组里放行 TCP 80。部署后，GPU 服务器上这样运行：
+
+```bash
+curl -fsSL http://<中转站>/h100/run.sh | sudo bash                        # 最新版（main）
+curl -fsSL http://<中转站>/h100/run.sh | sudo bash -s -- --expect any      # 带参数
+curl -fsSL http://<中转站>/h100/v1.1.0/run.sh | sudo bash                 # 指定版本
+```
+
+中转站走 HTTP 明文。链路不可信时，可以拿 `<版本>/SHA256SUMS` 里 `h100_check.py` 的哈希与 GitHub 上的文件比对。
 
 ## 离线测试
 
 `tests/` 里是不需要 GPU 的回归测试：`make_fixture.py` 生成模拟的 `/sys`、`/proc` 和一组假命令，`mocknv.c` 编译成模拟的 NVML/CUDA 动态库，`run_tests.sh` 逐个场景运行并检查：
 
 1. 退出码是否符合预期；
-2. 报告里是否包含关键结论；
+2. 报告里是否包含关键结论（以及不该出现的内容没有出现）；
 3. 是否只调用了白名单里的只读命令（每次调用都会记录下来比对）；
 4. stderr 是否为空。
 
@@ -146,5 +215,10 @@ PYTHON=python3.9 bash tests/run_tests.sh     # 指定解释器
 | `runfile` | 真 H100，驱动用 .run 覆盖安装在旧版 deb 包之上 → 通过，有告警（不误判为篡改） |
 | `h100pcie` | 8 张 H100 PCIe → 通过；加 `--expect h100-sxm` → 形态不符 |
 | `h20 --expect any` | 只检查一致性 → 通过 |
+| `rtx4090` | 8 张 RTX 4090（取自真实机器）：默认按 H100 核验 → 不通过；`--expect any` / `--expect 4090` → 通过，不报 ECC 关闭、peermem |
+| `rtx4090d --expect 4090` | 诚实的 4090 D 机器 → 不通过（非 RTX 4090） |
+| `rtx4090d-fake --expect 4090` | 硬件是 4090 D，nvidia-smi 被篡改成显示 4090 → 不通过 |
+| `rtx4090-48g --expect 4090` | 改装 48GB 显存的 4090 → 通过，有告警（改装大显存） |
+| `pciids --expect any` | 设备 ID 不在型号库里，按本机 pci.ids 识别 → 通过，并注明识别来源 |
 
 另有 3 项测试覆盖 `run.sh`：模拟 `curl … | bash` 正常执行；下载不完整时拒绝执行；误把 `h100_check.py` 直接管道给 bash 时给出正确用法提示。

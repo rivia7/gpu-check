@@ -8,8 +8,9 @@
 # 除了 -o 指定的报告文件，不在磁盘上写任何东西。
 #
 # 可选环境变量（经 sudo 传入时写成 sudo env 变量=值 bash）：
-#   H100_CHECK_REF     运行哪个版本（分支/标签/提交号），默认 main
-#   H100_CHECK_URL     直接指定 h100_check.py 的下载地址（如内网镜像），优先于 H100_CHECK_REF
+#   H100_CHECK_REF     运行哪个版本（分支/标签），默认 main
+#   H100_CHECK_BASE    下载源根地址，默认 GitHub；脚本从 <BASE>/<REF>/h100_check.py 下载（中转站会把默认值改成自己）
+#   H100_CHECK_URL     直接指定 h100_check.py 的完整下载地址，优先于以上两项
 #   H100_CHECK_PYTHON  指定 Python 解释器
 #
 # 全部代码包在 main 函数里：下载不完整时 bash 解析不到结尾，什么都不会执行。
@@ -17,7 +18,9 @@
 main() {
     set -u
     local ref="${H100_CHECK_REF:-main}"
-    local url="${H100_CHECK_URL:-https://raw.githubusercontent.com/rivia7/h100-check/${ref}/h100_check.py}"
+    local default_base='https://raw.githubusercontent.com/rivia7/h100-check'
+    local base="${H100_CHECK_BASE:-$default_base}"
+    local url="${H100_CHECK_URL:-${base%/}/${ref}/h100_check.py}"
     local marker='# ---- end of h100_check.py ----'
     local py="" c src
 
@@ -47,7 +50,7 @@ main() {
         *"$marker"*) ;;
         *)
             echo "h100_check: 下载失败或内容不完整：${url}" >&2
-            echo "  服务器访问不了 GitHub 时，可在能上网的机器上下载 h100_check.py 后执行：" >&2
+            echo "  服务器访问不了 GitHub 时：用 H100_CHECK_BASE 指向中转站，或在能上网的机器上下载 h100_check.py 后执行：" >&2
             echo "    ssh <服务器> 'sudo python3 -' < h100_check.py" >&2
             return 3
             ;;

@@ -14,6 +14,11 @@
   nodriver  真 H100 硬件，但未安装/未加载 NVIDIA 驱动
   h100pcie  8 张 H100 PCIe（无 NVSwitch、无 NVLink 桥）
   runfile   真 H100，但驱动是用 .run 覆盖安装在旧版 deb 包之上（包校验不一致，属运维问题而非篡改）
+  rtx4090        8 张 GeForce RTX 4090（数值取自一台真实机器的报告：ECC 关闭、空载、无 NVLink/NVSwitch）
+  rtx4090d       诚实的 RTX 4090 D 机器
+  rtx4090d-fake  硬件是 RTX 4090 D，nvidia-smi 被篡改成显示 RTX 4090
+  rtx4090-48g    改装成 48GB 显存的 RTX 4090（魔改卡）
+  pciids         设备 ID 不在内置型号库里（虚构的 0x26ff），只能靠本机 pci.ids（lspci）识别
 注意：H20/H800 的功耗、SM 数等数值只是测试占位，不代表真实规格。
 """
 import os
@@ -42,7 +47,20 @@ SPEC = {
     'h800': dict(devid=0x2324, subsys=0x17a6, name='NVIDIA H800', mem=81559, cores=16896, bus=5120,
                  maxw=700, maxsm=1980, maxmem=2619, links=8, pn='2324-885-A1', board_pn='692-2G520-0221-000',
                  inforom='G520.0221.00.01'),
+    'rtx4090': dict(devid=0x2684, subsys=0x167c, name='NVIDIA GeForce RTX 4090', mem=24564, cores=128 * 128, bus=384,
+                    maxw=600, maxsm=3225, maxmem=10501, links=0, pn='2684-301-A1', board_pn='N/A',
+                    inforom='G002.0000.00.03', arch='Ada Lovelace', cc='8.9', brand='GeForce', gen=4, ecc='Disabled',
+                    vbios='95.02.3C.C0.5A', util=0),
 }
+SPEC['rtx4090d'] = dict(SPEC['rtx4090'], devid=0x2685, subsys=0x16f3, name='NVIDIA GeForce RTX 4090 D',
+                        cores=114 * 128, pn='2685-301-A1')
+SPEC['rtx4090-48g'] = dict(SPEC['rtx4090'], mem=49140)
+SPEC['pciids'] = dict(SPEC['rtx4090'], devid=0x26ff, pn='26FF-301-A1')
+# 各场景：真实硬件用哪份规格；nvidia-smi 被篡改的场景另指定 nvidia-smi 显示的规格
+HW_OF = {'h20-fake': 'h20', 'rtx4090d-fake': 'rtx4090d'}
+SMI_OF = {'h20-fake': 'h100', 'rtx4090d-fake': 'rtx4090'}
+DEFAULTS = dict(arch='Hopper', cc='9.0', brand='NVIDIA', gen=5, ecc='Enabled', vbios='96.00.99.00.01', util=97)
+LINK = {4: '16.0 GT/s PCIe', 5: '32.0 GT/s PCIe'}
 
 
 def wr(path, content, mode=0o644):
@@ -102,14 +120,14 @@ def gpu_xml(i, bdf, sp, uuid, serial, extra):
     vol_unc = extra.get('vol_unc', 0)
     return '''	<gpu id="0000%(dom)s:%(PBUS)s:%(dev)s.0">
 		<product_name>%(name)s</product_name>
-		<product_brand>NVIDIA</product_brand>
-		<product_architecture>Hopper</product_architecture>
+		<product_brand>%(brand)s</product_brand>
+		<product_architecture>%(arch)s</product_architecture>
 		<persistence_mode>Enabled</persistence_mode>
 		<mig_mode><current_mig>Disabled</current_mig><pending_mig>Disabled</pending_mig></mig_mode>
 		<serial>%(serial)s</serial>
 		<uuid>%(uuid)s</uuid>
 		<minor_number>%(i)d</minor_number>
-		<vbios_version>96.00.99.00.01</vbios_version>
+		<vbios_version>%(vbios)s</vbios_version>
 		<multigpu_board>No</multigpu_board>
 		<board_id>0x%(pbus)s00</board_id>
 		<board_part_number>%(board_pn)s</board_part_number>
@@ -127,7 +145,7 @@ def gpu_xml(i, bdf, sp, uuid, serial, extra):
 			<pci_bus_id>0000%(dom)s:%(PBUS)s:%(dev)s.0</pci_bus_id>
 			<pci_sub_system_id>%(subsys)04X10DE</pci_sub_system_id>
 			<pci_gpu_link_info>
-				<pcie_gen><max_link_gen>5</max_link_gen><current_link_gen>5</current_link_gen></pcie_gen>
+				<pcie_gen><max_link_gen>%(gen)d</max_link_gen><current_link_gen>%(gen)d</current_link_gen></pcie_gen>
 				<link_widths><max_link_width>16x</max_link_width><current_link_width>16x</current_link_width></link_widths>
 			</pci_gpu_link_info>
 			<replay_counter>0</replay_counter>
@@ -135,10 +153,10 @@ def gpu_xml(i, bdf, sp, uuid, serial, extra):
 		<fan_speed>N/A</fan_speed>
 		<performance_state>P0</performance_state>
 		<clocks_event_reasons>%(thr)s</clocks_event_reasons>
-		<fb_memory_usage><total>%(mem)d MiB</total><reserved>329 MiB</reserved><used>76020 MiB</used><free>5210 MiB</free></fb_memory_usage>
+		<fb_memory_usage><total>%(mem)d MiB</total><reserved>329 MiB</reserved><used>%(used)d MiB</used><free>%(free)d MiB</free></fb_memory_usage>
 		<compute_mode>Default</compute_mode>
-		<utilization><gpu_util>97 %%</gpu_util><memory_util>41 %%</memory_util></utilization>
-		<ecc_mode><current_ecc>Enabled</current_ecc><pending_ecc>Enabled</pending_ecc></ecc_mode>
+		<utilization><gpu_util>%(util)d %%</gpu_util><memory_util>41 %%</memory_util></utilization>
+		<ecc_mode><current_ecc>%(ecc)s</current_ecc><pending_ecc>%(ecc)s</pending_ecc></ecc_mode>
 		<ecc_errors>
 			<volatile><sram_correctable>0</sram_correctable><sram_uncorrectable_parity>0</sram_uncorrectable_parity><sram_uncorrectable_secded>0</sram_uncorrectable_secded><dram_correctable>3</dram_correctable><dram_uncorrectable>%(vol_unc)d</dram_uncorrectable></volatile>
 			<aggregate><sram_correctable>0</sram_correctable><sram_uncorrectable_parity>0</sram_uncorrectable_parity><sram_uncorrectable_secded>0</sram_uncorrectable_secded><dram_correctable>15</dram_correctable><dram_uncorrectable>%(vol_unc)d</dram_uncorrectable><sram_threshold_exceeded>No</sram_threshold_exceeded></aggregate>
@@ -149,13 +167,14 @@ def gpu_xml(i, bdf, sp, uuid, serial, extra):
 		<clocks><graphics_clock>1755 MHz</graphics_clock><sm_clock>1755 MHz</sm_clock><mem_clock>%(maxmem)d MHz</mem_clock><video_clock>1545 MHz</video_clock></clocks>
 		<max_clocks><graphics_clock>%(maxsm)d MHz</graphics_clock><sm_clock>%(maxsm)d MHz</sm_clock><mem_clock>%(maxmem)d MHz</mem_clock><video_clock>1545 MHz</video_clock></max_clocks>
 		<fabric><state>Completed</state><status>Success</status><cliqueId>4026</cliqueId><clusterUuid>N/A</clusterUuid></fabric>
-		<processes><process_info><gpu_instance_id>N/A</gpu_instance_id><compute_instance_id>N/A</compute_instance_id><pid>%(pid)d</pid><type>C</type><process_name>python3</process_name><used_memory>76000 MiB</used_memory></process_info></processes>
+		<processes><process_info><gpu_instance_id>N/A</gpu_instance_id><compute_instance_id>N/A</compute_instance_id><pid>%(pid)d</pid><type>C</type><process_name>python3</process_name><used_memory>%(used)d MiB</used_memory></process_info></processes>
 		<accounted_processes></accounted_processes>
 		<capabilities><egm>disabled</egm></capabilities>
 	</gpu>
 ''' % dict(dom=dom, pbus=bus, PBUS=bus.upper(), dev=dev, i=i, mod=[2, 4, 3, 1, 7, 5, 8, 6][i], uuid=uuid, serial=serial,
            thr=thr_xml, vol_unc=vol_unc, rr_pending=extra.get('rr_pending', 'No'), temp=extra.get('temp', 61 + i),
-           mtemp=70 + i, pdraw=0.87 * sp['maxw'], pid=4000 + i, **sp)
+           mtemp=70 + i, pdraw=0.87 * sp['maxw'], pid=4000 + i, used=int(sp['mem'] * 0.93),
+           free=sp['mem'] - 329 - int(sp['mem'] * 0.93), **dict(DEFAULTS, **sp))
 
 
 FAKE_HEAD = '''#!/usr/bin/env python3
@@ -240,9 +259,10 @@ def build(scenario, out):
     root, data, binp = out + '/root', out + '/data', out + '/bin'
     os.makedirs(data)
     os.makedirs(binp)
-    hw = SPEC['h20'] if scenario in ('h20', 'h20-fake') else SPEC.get(scenario, SPEC['h100'])
-    pcie = scenario == 'h100pcie'
-    smi_spec = SPEC['h100'] if scenario == 'h20-fake' else hw
+    hw = dict(DEFAULTS, **SPEC[HW_OF.get(scenario, scenario if scenario in SPEC else 'h100')])
+    geforce = hw['brand'] == 'GeForce'
+    pcie = scenario == 'h100pcie' or geforce        # 无 NVSwitch、无 Fabric Manager
+    smi_spec = SPEC[SMI_OF[scenario]] if scenario in SMI_OF else hw
     driver = scenario != 'nodriver'
     deg = scenario == 'degraded'
 
@@ -263,7 +283,7 @@ def build(scenario, out):
     wr(root + '/proc/meminfo', 'MemTotal:       2113523840 kB\nMemFree:        1500000000 kB\n')
     mods = ['mlx5_ib', 'mlx5_core', 'ib_uverbs', 'ib_core', 'igb']
     if driver:
-        mods = ['nvidia_peermem', 'nvidia_uvm', 'nvidia_drm', 'nvidia_modeset', 'nvidia'] + mods
+        mods = (['nvidia_peermem'] if not geforce else []) + ['nvidia_uvm', 'nvidia_drm', 'nvidia_modeset', 'nvidia'] + mods
     wr(root + '/proc/modules', ''.join('%s 1000 0 - Live 0x0000000000000000\n' % m for m in mods))
     for k, v in (('sys_vendor', 'Supermicro'), ('product_name', 'SYS-821GE-TNHR'), ('product_serial', 'S7890123456'),
                  ('board_vendor', 'Supermicro'), ('board_name', 'X13DEG-OAD'),
@@ -278,7 +298,7 @@ def build(scenario, out):
     serials = ['16549220%05d' % (12340 + i) for i in range(8)]
     for i, bdf in enumerate(GPU_BDFS):
         pci_dev(root, bdf, 0x10de, hw['devid'], 0x030200, 0x10de, hw['subsys'], 0 if i < 4 else 1,
-                '32.0 GT/s PCIe', 16, '32.0 GT/s PCIe', 16, driver='nvidia' if driver else None)
+                LINK[hw['gen']], 16, LINK[hw['gen']], 16, driver='nvidia' if driver else None)
         if driver:
             wr('%s/proc/driver/nvidia/gpus/%s/information' % (root, bdf),
                'Model: \t\t %s\nIRQ:   \t\t 0\nGPU UUID: \t %s\nVideo BIOS: \t 96.00.99.00.01\nBus Type: \t PCIe\n'
@@ -376,7 +396,7 @@ def build(scenario, out):
             active = hw['links'] - (1 if (deg and i == 3) else 0)
             conf.append('|'.join([bdf, '0x%04x10de' % hw['devid'], '0x%04x10de' % hw['subsys'], hw['name'],
                                   str(hw['mem']), str(hw['cores']), str(hw['bus']), str(hw['maxw']),
-                                  str(hw['maxsm']), str(hw['maxmem']), '9.0', str(hw['links']), str(active),
+                                  str(hw['maxsm']), str(hw['maxmem']), hw['cc'], str(hw['links']), str(active),
                                   serials[i], uuids[i], ','.join(remote[:hw['links']])]))
         wr(out + '/nvml.conf', '\n'.join(conf) + '\n')
     dimm = []
@@ -391,15 +411,18 @@ def build(scenario, out):
     disks.append('NAME="nvme8n1" MODEL="SAMSUNG MZ1L2960HCJR-00A07" SIZE="960197124096" TYPE="disk" TRAN="nvme" ROTA="0"')
     disks.append('NAME="loop0" MODEL="" SIZE="67108864" TYPE="loop" TRAN="" ROTA="0"')
     wr(data + '/lsblk.txt', '\n'.join(disks) + '\n')
-    wr(data + '/lspci.txt', ''.join('%s "Ethernet controller [0200]" "Intel Corporation [8086]" '
-                                    '"I350 Gigabit Network Connection [1521]" -r01 "Super Micro Computer Inc [15d9]" '
-                                    '"Device [1521]"\n' % b for b in MGMT_BDFS))
+    lspci = ['%s "Ethernet controller [0200]" "Intel Corporation [8086]" "I350 Gigabit Network Connection [1521]" '
+             '-r01 "Super Micro Computer Inc [15d9]" "Device [1521]"' % b for b in MGMT_BDFS]
+    if scenario == 'pciids':
+        lspci += ['%s "3D controller [0302]" "NVIDIA Corporation [10de]" "AD102 [GeForce RTX 4090] [26ff]" -ra1 '
+                  '"NVIDIA Corporation [10de]" "Device [167c]"' % b for b in GPU_BDFS]
+    wr(data + '/lspci.txt', '\n'.join(lspci) + '\n')
     wr(data + '/fm.txt', 'LoadState=not-found\nActiveState=inactive\nSubState=dead\n' if pcie else
        'LoadState=loaded\nActiveState=%s\nSubState=%s\n' % (('inactive', 'dead') if deg else ('active', 'running')))
     if not pcie:
         wr(data + '/fm_pkg.txt', 'ii  nvidia-fabricmanager-550 550.54.15-1\n')
     smi_real = os.path.realpath(binp + '/nvidia-smi')
-    wr(data + '/dpkg_verify.txt', ('??5??????   %s\n' % smi_real) if scenario in ('h20-fake', 'runfile') else '')
+    wr(data + '/dpkg_verify.txt', ('??5??????   %s\n' % smi_real) if scenario in ('h20-fake', 'rtx4090d-fake', 'runfile') else '')
     wr(data + '/smi_pkg_ver.txt', '535.161.08-0ubuntu2.22.04.1' if scenario == 'runfile' else '550.54.15-0ubuntu0.22.04.1')
     dm = ['[    0.000000] Linux version 5.15.0-105-generic', '[   12.345678] nvidia: loading out-of-tree module']
     if deg:

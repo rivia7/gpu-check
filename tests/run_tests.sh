@@ -14,8 +14,8 @@ ALLOWED='^(nvidia-smi (-q -x|topo -m|nvlink -s|nvlink -e)|dmidecode -t 17|lsblk 
 pass=0
 fail=0
 
-check() {   # check <场景> <期望退出码> <报告中必须出现的文本>...   （额外参数放在环境变量 ARGS 里）
-    local sc="$1" want="$2" dir="${OUT}/$1${ARGS:+-x}" ok=1 rc pat
+check() {   # check <场景> <期望退出码> <报告中必须出现的文本>...（以 ! 开头表示不得出现；额外参数放在环境变量 ARGS 里）
+    local sc="$1" want="$2" dir="${OUT}/$1${ARGS:+-$(printf '%s' "${ARGS}" | tr -c 'a-zA-Z0-9' '_')}" ok=1 rc pat
     shift 2
     "$PY" "$HERE/make_fixture.py" "${sc}" "${dir}" || { echo "FAIL ${sc}：夹具生成失败"; fail=$((fail + 1)); return; }
     PATH="${dir}/bin:$PATH" MOCK_NV_CONF="${dir}/nvml.conf" "$PY" "$HERE/../h100_check.py" \
@@ -24,7 +24,10 @@ check() {   # check <场景> <期望退出码> <报告中必须出现的文本>.
     rc=$?
     [ "${rc}" = "${want}" ] || { echo "  [${sc}] 退出码 ${rc}，期望 ${want}"; ok=0; }
     for pat in "$@"; do
-        grep -qF -- "${pat}" "${dir}/report.txt" || { echo "  [${sc}] 报告中缺少：${pat}"; ok=0; }
+        case "${pat}" in
+            !*) ! grep -qF -- "${pat#!}" "${dir}/report.txt" || { echo "  [${sc}] 报告中不应出现：${pat#!}"; ok=0; } ;;
+            *) grep -qF -- "${pat}" "${dir}/report.txt" || { echo "  [${sc}] 报告中缺少：${pat}"; ok=0; } ;;
+        esac
     done
     if grep -vE "$ALLOWED" "${dir}/data/calls.log" | sed 's/^/    非白名单调用: /' | grep .; then ok=0; fi
     if [ -s "${dir}/stderr.txt" ]; then echo "  [${sc}] stderr 非空："; sed 's/^/    /' "${dir}/stderr.txt"; ok=0; fi
@@ -50,6 +53,16 @@ check runfile 1 '多半是用 .run 安装包覆盖' '8 张 GPU 确认为真 H100
 check h100pcie 0 '真 H100 PCIe' '8 张 GPU 确认为真 H100 PCIe 80GB' '本机 GPU 无 NVLink'
 ARGS='--expect h100-sxm' check h100pcie 2 '实为 H100 PCIe 80GB，与期望的 H100 SXM5 版不符' '形态不符: H100 PCIe'
 ARGS='--expect any' check h20 0 '8 张 GPU 确认为真 H20 96GB'
+# 消费级显卡：默认按 H100 核验 → 不通过；--expect any / 4090 → 通过，且不报 GeForce 无关的 ECC、peermem 提示
+check rtx4090 2 '实为 RTX 4090，不是 H100' '非H100: RTX 4090' '四、H100 真伪核验'
+ARGS='--expect any' check rtx4090 0 '8/8 张 GPU 确认为 RTX 4090' '真 RTX 4090' '| 128 ' '| 0%' '四、GPU 型号与真伪核验' \
+    '!ECC 已关闭' '!nvidia_peermem' '!0.0%' '!待确认'
+ARGS='--expect 4090' check rtx4090 0 '四、RTX 4090 真伪核验' '核验目标: RTX 4090'
+ARGS='--expect 4090' check rtx4090d 2 '实为 RTX 4090 D，不是 RTX 4090' '非RTX 4090: RTX 4090 D' '| 114 '
+ARGS='--expect 4090' check rtx4090d-fake 2 '实为 RTX 4090 D，不是 RTX 4090' 'nvidia-smi 报告“NVIDIA GeForce RTX 4090”' \
+    'nvidia-smi 上报设备 ID 0x2684' '文件在安装后被修改'
+ARGS='--expect 4090' check rtx4090-48g 1 '疑似改装大显存' '真 RTX 4090(改装48G显存)' '[通过，有告警]'
+ARGS='--expect any' check pciids 0 '按本机 pci.ids 识别' '真 GeForce RTX 4090'
 
 # ---- run.sh 一键入口：模拟 curl ... | bash（下载地址用 file://，复用上面生成的 h100 场景）
 expect_rc() {   # expect_rc <名称> <期望退出码> <实际退出码> <输出文件> <必须出现的文本>

@@ -1,0 +1,2432 @@
+#!/bin/sh
+''''[ -f "$0" ] || { echo "h100_check: 请用 curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/main/run.sh | sudo bash" >&2; exit 3; }  # '''
+''''command -v python3 >/dev/null 2>&1 && exec python3 "$0" "$@"                        # '''
+''''[ -x /usr/libexec/platform-python ] && exec /usr/libexec/platform-python "$0" "$@"    # '''
+''''echo "h100_check: 需要 Python 3.6+（未找到 python3 或 platform-python）" >&2; exit 3 # '''
+#
+# h100_check.py —— H100 GPU 服务器只读检测脚本
+#   硬件清单 + IB 网卡 + NVLink 拓扑 + H100 真伪核验（防 H20/H800 冒充、防 nvidia-smi 篡改）
+#
+# 对线上业务零干扰：
+#   * 只读：仅读取 sysfs/procfs，调用 nvidia-smi / NVML 的查询接口，以及 dmidecode、lsblk 等只读命令；
+#   * 不创建 CUDA 上下文、不分配显存、不运行任何 kernel / 压测 / 带宽测试，不重置任何计数器；
+#   * 不修改任何配置（时钟、功耗墙、ECC、MIG、持久模式、Fabric Manager 等一律不碰）；
+#   * 自身以 nice 19 + ionice idle 运行，所有外部命令都有超时，默认不写任何文件。
+#
+# 用法：sudo ./h100_check.py [-o report.txt] [--expect h100-sxm] [--expect-gpus 8] [--cuda]
+#       非 root 也能运行，但内存条、整机序列号、网卡料号、内核日志等需要 root 才能读取。
+#
+# 退出码：0=全部通过  1=有告警（健康/配置类）  2=真伪不通过（非 H100 或疑似篡改）  3=运行错误
+#
+import argparse
+import ctypes
+import hashlib
+import io
+import os
+import platform
+import re
+import shlex
+import socket
+import struct
+import subprocess
+import sys
+import time
+import unicodedata
+import xml.etree.ElementTree as ET
+from collections import Counter
+
+VERSION = '1.0.0'
+
+OK, INFO, WARN, FAIL = 0, 1, 2, 3
+LEVEL_TEXT = {OK: '通过', INFO: '提示', WARN: '警告', FAIL: '不通过'}
+CATEGORIES = ['真伪', '工具链', 'NVLink', 'IB/RDMA', 'PCIe', 'GPU健康', '系统']
+
+
+class G(object):
+    """全局运行参数"""
+    sysroot = ''        # 仅用于离线/测试：从 <sysroot>/sys、<sysroot>/proc 读取
+    test_mode = False
+    is_root = False
+    color = False
+
+
+# ============================================================================
+# 型号库：PCI 设备 ID 由 GPU 芯片熔丝决定，改名、改标签、改 nvidia-smi 都改不了。
+# 来源：pci.ids 数据库 + NVIDIA 驱动 README 支持列表（open-gpu-kernel-modules）。
+#   sms=SM 数  bus=显存位宽(bit)  maxw=最大功耗墙(W)  maxsm/maxmem=最大频率(MHz)
+#   links=NVLink 链路数  strict=参考值可信度高，SM/位宽/显存偏差直接判“不通过”
+# ============================================================================
+
+def _sku(sku, family, form, mem, arch='Hopper', **kw):
+    d = dict(sku=sku, family=family, form=form, mem=mem, arch=arch, sms=None, bus=None,
+             maxw=None, maxsm=None, maxmem=None, links=None, strict=False, note='')
+    d.update(kw)
+    return d
+
+
+_H20 = '面向中国市场的算力阉割特供版（BF16 稠密算力约为 H100 SXM 的 15%）'
+_H800 = '面向中国市场的特供版（NVLink 带宽阉割为 400GB/s，H100 SXM 为 900GB/s）'
+_ES = '未命名的 GH100 设备 ID，可能是工程样品（ES/QS），并非正式零售 H100'
+
+GPU_DB = {
+    # ---- H100 ----
+    0x2330: _sku('H100 SXM5 80GB', 'H100', 'SXM5', 80, sms=132, bus=5120, maxw=700,
+                 maxsm=1980, maxmem=2619, links=18, strict=True),
+    0x2331: _sku('H100 PCIe 80GB', 'H100', 'PCIe', 80, sms=114, bus=5120, maxw=350,
+                 maxsm=1755, maxmem=1593, strict=True),
+    0x2321: _sku('H100 NVL 94GB', 'H100', 'NVL', 94, sms=132, maxw=400),
+    0x2339: _sku('H100 SXM5 94GB', 'H100', 'SXM5', 94, links=18),
+    0x2338: _sku('H100 SXM5 96GB', 'H100', 'SXM5', 96, links=18),
+    0x2337: _sku('H100 SXM5 64GB', 'H100', 'SXM5', 64, links=18),
+    0x233d: _sku('H100 96GB', 'H100', '?', 96),
+    0x2336: _sku('H100 (GH100 变体)', 'H100', '?', None),
+    0x2313: _sku('H100 CNX', 'H100', 'PCIe', 80),
+    # ---- H800 / H20：特供版，不是 H100 ----
+    0x2324: _sku('H800 SXM5 80GB', 'H800', 'SXM5', 80, links=8, note=_H800),
+    0x2322: _sku('H800 PCIe 80GB', 'H800', 'PCIe', 80, note=_H800),
+    0x233a: _sku('H800 NVL 94GB', 'H800', 'NVL', 94, note=_H800),
+    0x2329: _sku('H20 96GB', 'H20', 'SXM5', 96, note=_H20),
+    0x2328: _sku('H20B', 'H20', 'SXM5', None, note=_H20),
+    0x232c: _sku('H20-3e 141GB', 'H20', 'SXM5', 141, note=_H20),
+    0x230c: _sku('H20 NVL16', 'H20', 'NVL16', None, note=_H20),
+    0x230e: _sku('H20 NVL16', 'H20', 'NVL16', None, note=_H20),
+    # ---- H200 / GH200 ----
+    0x2335: _sku('H200 SXM 141GB', 'H200', 'SXM5', 141, links=18),
+    0x233b: _sku('H200 NVL 141GB', 'H200', 'NVL', 141),
+    0x2342: _sku('GH200 Grace Hopper', 'GH200', 'Superchip', None),
+    0x2348: _sku('GH200 144GB HBM3e', 'GH200', 'Superchip', 144),
+    # ---- 未命名 GH100 ----
+    0x2302: _sku('GH100 未命名ID', 'GH100?', '?', None, note=_ES),
+    0x2343: _sku('GH100 未命名ID', 'GH100?', '?', None, note=_ES),
+    0x2345: _sku('GH100-88K-A1', 'GH100?', '?', None, note=_ES),
+    # ---- Ampere ----
+    0x20b0: _sku('A100 SXM4 40GB', 'A100', 'SXM4', 40, arch='Ampere'),
+    0x20b2: _sku('A100 SXM4 80GB', 'A100', 'SXM4', 80, arch='Ampere'),
+    0x20b3: _sku('A100 SXM 64GB', 'A100', 'SXM4', 64, arch='Ampere'),
+    0x20b1: _sku('A100 PCIe 40GB', 'A100', 'PCIe', 40, arch='Ampere'),
+    0x20f1: _sku('A100 PCIe 40GB', 'A100', 'PCIe', 40, arch='Ampere'),
+    0x20b5: _sku('A100 PCIe 80GB', 'A100', 'PCIe', 80, arch='Ampere'),
+    0x20b7: _sku('A30 24GB', 'A30', 'PCIe', 24, arch='Ampere'),
+    0x20bd: _sku('A800 SXM4 40GB', 'A800', 'SXM4', 40, arch='Ampere'),
+    0x20f3: _sku('A800 SXM4 80GB', 'A800', 'SXM4', 80, arch='Ampere'),
+    0x20f5: _sku('A800 PCIe 80GB', 'A800', 'PCIe', 80, arch='Ampere'),
+    0x20f6: _sku('A800 40GB Active', 'A800', 'PCIe', 40, arch='Ampere'),
+    # ---- Ada ----
+    0x26b5: _sku('L40 48GB', 'L40', 'PCIe', 48, arch='Ada Lovelace'),
+    0x26b9: _sku('L40S 48GB', 'L40S', 'PCIe', 48, arch='Ada Lovelace'),
+    0x26ba: _sku('L20 48GB', 'L20', 'PCIe', 48, arch='Ada Lovelace'),
+    0x27b8: _sku('L4 24GB', 'L4', 'PCIe', 24, arch='Ada Lovelace'),
+    0x27b6: _sku('L2', 'L2', 'PCIe', None, arch='Ada Lovelace'),
+    # ---- Blackwell ----
+    0x2901: _sku('B200', 'B200', 'SXM6', None, arch='Blackwell'),
+    0x2909: _sku('B200', 'B200', 'SXM6', None, arch='Blackwell'),
+    0x2941: _sku('GB200', 'GB200', 'Superchip', None, arch='Blackwell'),
+    0x3182: _sku('B300', 'B300', 'SXM6', None, arch='Blackwell'),
+}
+
+FAMILY_RE = re.compile(r'(?<![A-Za-z0-9])(GH200|GB200|GB300|H200|H100|H800|H20|A100|A800|A30|'
+                       r'L40S|L40|L20|L4|L2|B200|B300|B100)(?![0-9])', re.I)
+KNOWN_FAMILIES = {'GH200', 'GB200', 'GB300', 'H200', 'H100', 'H800', 'H20', 'A100', 'A800', 'A30',
+                  'L40S', 'L40', 'L20', 'L4', 'L2', 'B200', 'B300', 'B100'}
+
+NVSWITCH_DB = {0x1af1: 'NVSwitch Gen2 (A100)', 0x22a3: 'NVSwitch Gen3 (H100)'}
+
+MLX_DB = {
+    0x1013: 'ConnectX-4', 0x1015: 'ConnectX-4 Lx', 0x1017: 'ConnectX-5', 0x1019: 'ConnectX-5 Ex',
+    0x101b: 'ConnectX-6', 0x101d: 'ConnectX-6 Dx', 0x101f: 'ConnectX-6 Lx', 0x1021: 'ConnectX-7',
+    0x1023: 'ConnectX-8', 0x1025: 'ConnectX-9', 0xa2d6: 'BlueField-2', 0xa2d9: 'BlueField-3 Lx',
+    0xa2dc: 'BlueField-3', 0x1014: 'ConnectX-4 VF', 0x1016: 'ConnectX-4 Lx VF',
+    0x1018: 'ConnectX-5 VF', 0x101a: 'ConnectX-5 Ex VF', 0x101c: 'ConnectX-6 VF', 0x101e: 'ConnectX VF',
+}
+
+XID_DESC = {
+    13: '图形引擎异常（多为应用问题）', 31: 'GPU 内存页错误（多为应用问题）',
+    43: 'GPU 停止处理（多为应用问题）', 45: '抢占清理（进程被终止）', 48: '双比特 ECC 错误',
+    61: '内部微控制器断点', 62: '内部微控制器挂起', 63: 'ECC 页退役/行重映射事件',
+    64: 'ECC 页退役/行重映射失败', 68: '视频解码引擎异常', 69: '图形引擎类错误', 74: 'NVLink 错误',
+    79: 'GPU 掉卡（fallen off the bus）', 92: '单比特 ECC 错误率过高', 94: '可控 ECC 错误（contained）',
+    95: '不可控 ECC 错误（uncontained）', 109: '上下文切换超时', 119: 'GSP RPC 超时', 120: 'GSP 错误',
+}
+XID_APP = {13, 31, 43, 45, 68, 69, 109}
+
+THROTTLE_CN = {
+    'sw_power_cap': '软件功耗墙', 'hw_slowdown': '硬件降频', 'hw_thermal_slowdown': '硬件过热降频',
+    'hw_power_brake_slowdown': '功耗刹车', 'sw_thermal_slowdown': '软件过热降频',
+    'sync_boost': '同步加速', 'applications_clocks_setting': '应用时钟', 'display_clocks_setting': '显示时钟',
+}
+THROTTLE_BAD = {'hw_slowdown', 'hw_thermal_slowdown', 'hw_power_brake_slowdown', 'sw_thermal_slowdown'}
+
+TOPO_RANK = {'X': 0, 'PIX': 1, 'PXB': 2, 'PHB': 3, 'NODE': 4, 'SOC': 5, 'SYS': 5}
+
+
+# ============================================================================
+# 基础工具
+# ============================================================================
+
+def P(path):
+    return G.sysroot + path if G.sysroot else path
+
+
+def read_text(path, default=None, limit=1 << 22):
+    try:
+        with open(P(path), 'rb') as f:
+            return f.read(limit).decode('utf-8', 'replace').strip()
+    except Exception:
+        return default
+
+
+def read_hex(path):
+    s = read_text(path)
+    try:
+        return int(s, 16) if s else None
+    except ValueError:
+        return None
+
+
+def read_int(path):
+    s = read_text(path)
+    try:
+        return int(s.split()[0]) if s else None
+    except (ValueError, IndexError):
+        return None
+
+
+def listdir(path):
+    try:
+        return sorted(os.listdir(P(path)))
+    except Exception:
+        return []
+
+
+def exists(path):
+    return os.path.exists(P(path))
+
+
+def link_name(path):
+    """符号链接目标的最后一段（驱动名、PCI 地址等）"""
+    full = P(path)
+    try:
+        return os.path.basename(os.path.realpath(full)) if os.path.exists(full) else None
+    except Exception:
+        return None
+
+
+def which(name, extra=()):
+    dirs = os.environ.get('PATH', '').split(os.pathsep)
+    dirs += ['/usr/sbin', '/sbin', '/usr/local/sbin', '/usr/bin', '/bin'] + list(extra)
+    for d in dirs:
+        if d:
+            p = os.path.join(d, name)
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                return p
+    return None
+
+
+def _dec(b):
+    return (b or b'').decode('utf-8', 'replace')
+
+
+def run(cmd, timeout=30):
+    """运行只读命令，返回 (rc, stdout, stderr)。命令不存在返回 127，超时返回 124。"""
+    if not cmd or not cmd[0]:
+        return 127, '', 'not found'
+    env = dict(os.environ)
+    env['LC_ALL'] = 'C'
+    env['LANG'] = 'C'
+    env.pop('LD_PRELOAD', None)       # 不让本进程环境里的 LD_PRELOAD 影响被调用的工具
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, env=env, close_fds=True)
+    except OSError as e:
+        return 127, '', str(e)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        try:
+            out, err = p.communicate(timeout=5)
+        except Exception:
+            out, err = b'', b''
+        return 124, _dec(out), '超时（%ss）' % timeout
+    return p.returncode, _dec(out), _dec(err)
+
+
+def first_line(*texts):
+    for t in texts:
+        for line in (t or '').splitlines():
+            if line.strip():
+                return line.strip()[:200]
+    return ''
+
+
+def num(s):
+    """'700.00 W' -> 700.0；'81559 MiB' -> 81559.0；无法解析返回 None"""
+    if s is None:
+        return None
+    m = re.search(r'-?\d+(?:\.\d+)?', str(s))
+    return float(m.group(0)) if m else None
+
+
+def norm_bdf(s):
+    """统一 PCI 地址格式：00000000:18:00.0 / 0000:18:00.0 -> 0000:18:00.0"""
+    if not s:
+        return None
+    m = re.search(r'([0-9a-fA-F]+):([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])', s)
+    if not m:
+        return s.strip().lower()
+    return '%04x:%s:%s.%s' % (int(m.group(1), 16), m.group(2).lower(), m.group(3).lower(), m.group(4))
+
+
+def short_bdf(bdf):
+    return bdf[5:] if bdf and bdf.startswith('0000:') else (bdf or '-')
+
+
+def pcie_gen(speed):
+    m = re.match(r'\s*([\d.]+)\s*GT/s', speed or '')
+    if not m:
+        return None
+    v = float(m.group(1))
+    for gen, gts in ((6, 64), (5, 32), (4, 16), (3, 8), (2, 5), (1, 2.5)):
+        if abs(v - gts) < 0.6:
+            return gen
+    return None
+
+
+def fmt_link(speed, width):
+    gen = pcie_gen(speed)
+    w = (width or '').strip().rstrip('x')
+    if gen is None and not w:
+        return '-'
+    return 'Gen%s x%s' % (gen if gen else '?', w if w else '?')
+
+
+def compress_ids(ids):
+    ids = sorted(set(i for i in ids if i is not None))
+    out, i = [], 0
+    while i < len(ids):
+        j = i
+        while j + 1 < len(ids) and ids[j + 1] == ids[j] + 1:
+            j += 1
+        out.append(str(ids[i]) if i == j else '%d-%d' % (ids[i], ids[j]))
+        i = j + 1
+    return ','.join(out)
+
+
+def family_of(name):
+    m = FAMILY_RE.search(name or '')
+    return m.group(1).upper() if m else None
+
+
+def s(v, default='-'):
+    if v is None or v == '':
+        return default
+    return str(v)
+
+
+def fmt_duration(sec):
+    sec = int(sec)
+    d, rem = divmod(sec, 86400)
+    h, rem = divmod(rem, 3600)
+    return ('%d 天 %d 小时' % (d, h)) if d else ('%d 小时 %d 分' % (h, rem // 60))
+
+
+# ---------------------------------------------------------------- 颜色与表格
+
+ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def _c(code, t):
+    return '\x1b[%sm%s\x1b[0m' % (code, t) if (G.color and t) else t
+
+
+def red(t): return _c('1;31', t)
+def green(t): return _c('32', t)
+def yellow(t): return _c('1;33', t)
+def cyan(t): return _c('36', t)
+def bold(t): return _c('1', t)
+def dim(t): return _c('2', t)
+
+
+def lvl_color(level, t):
+    return {OK: green, INFO: cyan, WARN: yellow, FAIL: red}.get(level, str)(t)
+
+
+def badge(level):
+    return lvl_color(level, LEVEL_TEXT[level])
+
+
+def dwidth(t):
+    """终端显示宽度（中文/全角占 2 列）"""
+    w = 0
+    for ch in ANSI_RE.sub('', t):
+        if unicodedata.combining(ch) or ord(ch) < 32:
+            continue
+        w += 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+    return w
+
+
+def clip(t, maxw):
+    """按显示宽度截断（只用于不含颜色的字符串）"""
+    if maxw is None or dwidth(t) <= maxw:
+        return t
+    out, w = [], 0
+    for ch in t:
+        cw = 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+        if w + cw > maxw - 2:
+            break
+        out.append(ch)
+        w += cw
+    return ''.join(out) + '..'
+
+
+def pad(t, width, align='l'):
+    gap = max(0, width - dwidth(t))
+    if align == 'r':
+        return ' ' * gap + t
+    if align == 'c':
+        return ' ' * (gap // 2) + t + ' ' * (gap - gap // 2)
+    return t + ' ' * gap
+
+
+class Report(object):
+    def __init__(self):
+        self.lines = []
+
+    def add(self, text=''):
+        self.lines.extend(text.split('\n'))
+
+    def section(self, title):
+        self.add('')
+        self.add(bold(cyan('■ ' + title)))
+
+    def sub(self, title):
+        self.add('  ' + bold(title))
+
+    def note(self, text):
+        for line in text.split('\n'):
+            self.add('  ' + dim(line))
+
+    def table(self, headers, rows, aligns=None, indent=2):
+        n = len(headers)
+        rows = [None if r is None else [s(c) for c in (list(r) + [''] * n)[:n]] for r in rows]
+        widths = [dwidth(h) for h in headers]
+        for r in rows:
+            if r is not None:
+                for i, c in enumerate(r):
+                    widths[i] = max(widths[i], dwidth(c))
+        aligns = (aligns or '') + 'l' * n
+        pre = ' ' * indent
+        line = pre + '+' + '+'.join('-' * (w + 2) for w in widths) + '+'
+        self.add(line)
+        self.add(pre + '|' + '|'.join(' %s ' % pad(bold(h), widths[i]) for i, h in enumerate(headers)) + '|')
+        self.add(line.replace('-', '='))
+        for r in rows:
+            if r is None:
+                self.add(line)
+                continue
+            self.add(pre + '|' + '|'.join(' %s ' % pad(c, widths[i], aligns[i]) for i, c in enumerate(r)) + '|')
+        self.add(line)
+
+    def kv(self, pairs, indent=2):
+        self.table(['项目', '信息'], [p for p in pairs if p is not None], indent=indent)
+
+
+class Findings(object):
+    items = []   # (category, level, message)
+
+    @classmethod
+    def add(cls, cat, level, msg):
+        cls.items.append((cat, level, msg))
+
+    @classmethod
+    def worst(cls, cats=None):
+        lv = [lvl for c, lvl, _ in cls.items if cats is None or c in cats]
+        return max(lv) if lv else OK
+
+
+# ============================================================================
+# 采集：系统 / CPU / 内存 / 存储
+# ============================================================================
+
+def collect_system():
+    st = {}
+    st['hostname'] = read_text('/proc/sys/kernel/hostname') or socket.gethostname()
+    osr = {}
+    for line in (read_text('/etc/os-release', '') or '').splitlines():
+        if '=' in line:
+            k, v = line.split('=', 1)
+            osr[k.strip()] = v.strip().strip('"')
+    st['os'] = osr.get('PRETTY_NAME') or ' '.join(x for x in (osr.get('NAME'), osr.get('VERSION')) if x) or None
+    st['kernel'] = read_text('/proc/sys/kernel/osrelease') or platform.release()
+    st['arch'] = (read_text('/proc/sys/kernel/arch') if G.test_mode else None) or platform.machine()   # 测试时取夹具里的架构
+    up = read_text('/proc/uptime')
+    try:
+        st['uptime'] = fmt_duration(float(up.split()[0])) if up else None
+    except ValueError:
+        st['uptime'] = None
+    for k in ('sys_vendor', 'product_name', 'product_serial', 'board_vendor', 'board_name',
+              'bios_vendor', 'bios_version', 'bios_date'):
+        st[k] = read_text('/sys/class/dmi/id/' + k)
+    virt = None
+    sdv = which('systemd-detect-virt')
+    if sdv:
+        _, out, _ = run([sdv, '--vm'], 10)
+        virt = out.strip() or None
+    if virt in (None, 'none'):
+        cpuinfo = read_text('/proc/cpuinfo', '') or ''
+        if re.search(r'^flags\s*:.*\bhypervisor\b', cpuinfo, re.M):
+            virt = 'vm'
+        elif virt is None:
+            virt = 'none'
+    st['virt'] = virt
+    cg = read_text('/proc/1/cgroup', '') or ''
+    st['container'] = (exists('/.dockerenv') or exists('/run/.containerenv')
+                       or bool(re.search(r'docker|kubepods|containerd|lxc', cg)))
+    return st
+
+
+def collect_cpu():
+    txt = read_text('/proc/cpuinfo', '') or ''
+    model, phys, cores_per, threads = None, set(), None, 0
+    for line in txt.splitlines():
+        if ':' not in line:
+            continue
+        k, v = [x.strip() for x in line.split(':', 1)]
+        if k == 'processor':
+            threads += 1
+        elif k == 'model name' and not model:
+            model = v
+        elif k == 'physical id':
+            phys.add(v)
+        elif k == 'cpu cores' and cores_per is None:
+            try:
+                cores_per = int(v)
+            except ValueError:
+                pass
+    sockets = len(phys) or None
+    if not model or not sockets or not cores_per:            # ARM（Grace）等平台用 lscpu 补全
+        lscpu = which('lscpu')
+        if lscpu:
+            _, out, _ = run([lscpu], 10)
+            kv = {}
+            for line in out.splitlines():
+                if ':' in line:
+                    k, v = line.split(':', 1)
+                    kv[k.strip()] = v.strip()
+            model = model or kv.get('Model name')
+            try:
+                sockets = sockets or int(kv.get('Socket(s)', '0')) or None
+                cores_per = cores_per or int(kv.get('Core(s) per socket', '0')) or None
+            except ValueError:
+                pass
+    numa = len([n for n in listdir('/sys/devices/system/node') if re.match(r'node\d+$', n)])
+    return dict(model=model, sockets=sockets, cores=(cores_per * sockets) if (cores_per and sockets) else None,
+                threads=threads or None, numa=numa or None)
+
+
+def _size_gb(txt):
+    m = re.match(r'(\d+)\s*(GB|MB|TB|GiB|MiB|TiB)', txt or '')
+    if not m:
+        return None
+    v, u = int(m.group(1)), m.group(2)[0]
+    return v / 1024.0 if u == 'M' else (v * 1024 if u == 'T' else v)
+
+
+def collect_memory():
+    mem = {'total_gib': None, 'dimms': None}
+    mt = re.search(r'MemTotal:\s+(\d+) kB', read_text('/proc/meminfo', '') or '')
+    if mt:
+        mem['total_gib'] = int(mt.group(1)) / 1048576.0
+    dmi = which('dmidecode')
+    if G.is_root and dmi:
+        rc, out, _ = run([dmi, '-t', '17'], 30)
+        if rc == 0:
+            dimms = []
+            for block in re.split(r'\n(?=Handle )', out):
+                if 'Memory Device' not in block:
+                    continue
+                kv = {}
+                for line in block.splitlines():
+                    if ':' in line:
+                        k, v = line.split(':', 1)
+                        kv.setdefault(k.strip(), v.strip())
+                dimms.append(kv)
+            mem['dimms'] = dimms
+    return mem
+
+
+def collect_storage():
+    lb = which('lsblk')
+    if not lb:
+        return None
+    rc, out, _ = run([lb, '-d', '-n', '-P', '-b', '-o', 'NAME,MODEL,SIZE,TYPE,TRAN,ROTA'], 20)
+    if rc != 0:
+        rc, out, _ = run([lb, '-d', '-n', '-P', '-b', '-o', 'NAME,MODEL,SIZE,TYPE,ROTA'], 20)
+    disks = []
+    for line in out.splitlines():
+        kv = dict(re.findall(r'([\w:-]+)="([^"]*)"', line))
+        if kv.get('TYPE') == 'disk' and not re.match(r'(loop|ram|zram|nbd)', kv.get('NAME', '')):
+            disks.append(kv)
+    return disks
+
+
+# ============================================================================
+# 采集：PCI 设备（sysfs，内核 PCI 子系统提供，与 NVIDIA 驱动无关）
+# ============================================================================
+
+def is_nv_gpu(p):
+    return p and p.get('vendor') == 0x10de and (p.get('cls') or 0) >> 8 in (0x0300, 0x0302)
+
+
+def is_nvswitch(p):
+    return p and p.get('vendor') == 0x10de and (p.get('cls') or 0) >> 8 == 0x0680
+
+
+def scan_pci():
+    devs = {}
+    for bdf in listdir('/sys/bus/pci/devices'):
+        base = '/sys/bus/pci/devices/' + bdf
+        vendor = read_hex(base + '/vendor')
+        if vendor is None:
+            continue
+        p = dict(bdf=bdf, vendor=vendor, device=read_hex(base + '/device'), cls=read_hex(base + '/class'))
+        # 只对关心的设备（NVIDIA、Mellanox、网卡）读取详细属性，尽量少碰硬件
+        if vendor in (0x10de, 0x15b3) or ((p['cls'] or 0) >> 16) == 0x02:
+            p.update(svendor=read_hex(base + '/subsystem_vendor'), sdevice=read_hex(base + '/subsystem_device'),
+                     driver=link_name(base + '/driver'), numa=read_int(base + '/numa_node'),
+                     cur_speed=read_text(base + '/current_link_speed'),
+                     cur_width=read_text(base + '/current_link_width'),
+                     max_speed=read_text(base + '/max_link_speed'),
+                     max_width=read_text(base + '/max_link_width'),
+                     is_vf=exists(base + '/physfn'))
+        devs[bdf] = p
+    return devs
+
+
+def read_cfg_ids(bdf):
+    """实时读取 PCI 配置空间前 64 字节（普通用户也可读），与内核缓存的设备 ID 交叉核对"""
+    try:
+        with open(P('/sys/bus/pci/devices/%s/config' % bdf), 'rb') as f:
+            b = f.read(64)
+        if len(b) < 0x30:
+            return None
+        v, d = struct.unpack_from('<HH', b, 0)
+        sv, sd = struct.unpack_from('<HH', b, 0x2c)
+        return dict(vendor=v, device=d, svendor=sv, sdevice=sd)
+    except Exception:
+        return None
+
+
+def lspci_names():
+    lp = which('lspci')
+    names = {}
+    if not lp:
+        return names
+    rc, out, _ = run([lp, '-D', '-mm', '-nn'], 20)
+    for line in out.splitlines():
+        try:
+            parts = shlex.split(line)
+        except ValueError:
+            continue
+        if len(parts) >= 4:
+            names[parts[0].lower()] = re.sub(r'\s*\[[0-9a-fA-F]{4}\]$', '', parts[3])
+    return names
+
+
+def loaded_modules():
+    mods = set()
+    for line in (read_text('/proc/modules', '') or '').splitlines():
+        if line.strip():
+            mods.add(line.split()[0])
+    return mods
+
+
+# ============================================================================
+# 采集：NVIDIA 驱动、工具链完整性
+# ============================================================================
+
+def collect_driver():
+    d = {'proc_ok': False}
+    txt = read_text('/proc/driver/nvidia/version')
+    if txt:
+        d['proc_ok'] = True
+        first = txt.splitlines()[0]
+        d['kmod_line'] = re.sub(r'^NVRM version:\s*', '', first).strip()
+        m = re.search(r'Kernel Module(?:\s+for\s+\S+)?\s+(\d+\.\d+(?:\.\d+)?)', first)
+        d['kmod_version'] = m.group(1) if m else None
+        d['kmod_open'] = 'Open Kernel Module' in first
+        m = re.search(r'\(([^()]*@[^()]*)\)', first)
+        d['kmod_builder'] = m.group(1) if m else None
+    d['taint'] = read_text('/sys/module/nvidia/taint')
+    d['srcversion'] = read_text('/sys/module/nvidia/srcversion')
+    preload = read_text('/etc/ld.so.preload') or ''
+    d['preload_file'] = [x.strip() for x in preload.splitlines() if x.strip() and not x.strip().startswith('#')]
+    d['preload_env'] = os.environ.get('LD_PRELOAD')
+    return d
+
+
+def locate_all(name, extra_dirs):
+    found, seen = [], set()
+    for d in os.environ.get('PATH', '').split(os.pathsep) + list(extra_dirs):
+        if not d:
+            continue
+        p = os.path.join(d, name)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            rp = os.path.realpath(p)
+            if rp not in seen:
+                seen.add(rp)
+                found.append(p)
+    return found
+
+
+def pkg_verify(path):
+    """返回 (包名, 包版本, 校验结果 True/False/None, 说明)。只读：dpkg --verify / rpm -V 仅比对校验和。"""
+    if which('dpkg-query'):
+        rc, out, _ = run(['dpkg-query', '-S', path], 20)
+        line = first_line(out)
+        if rc == 0 and ': ' in line and not line.startswith('diversion'):
+            pkg = line.rsplit(': ', 1)[0].split(', ')[0].strip()
+            _, ver, _ = run(['dpkg-query', '-W', '-f', '${Version}', pkg], 20)
+            rc2, out2, _ = run(['dpkg', '--verify', pkg], 90)
+            for l2 in out2.splitlines():
+                if l2.rstrip().endswith(path) and len(l2) > 2 and l2[2] == '5':
+                    return pkg, ver.strip(), False, '文件校验和与软件包 %s 不一致' % pkg
+            return pkg, ver.strip(), True, 'dpkg 校验一致（%s %s）' % (pkg, ver.strip())
+    if which('rpm'):
+        rc, out, _ = run(['rpm', '-qf', '--qf', '%{NAME} %{VERSION}\n', path], 20)
+        parts = first_line(out).split()
+        if rc == 0 and len(parts) == 2 and 'not owned' not in out:
+            pkg, ver = parts
+            rc2, out2, _ = run(['rpm', '-V', pkg], 90)
+            for l2 in out2.splitlines():
+                if l2.rstrip().endswith(path) and len(l2) > 2 and l2[2] == '5':
+                    return pkg, ver, False, '文件校验和与软件包 %s 不一致' % pkg
+            return pkg, ver, True, 'rpm 校验一致（%s %s）' % (pkg, ver)
+    return None, None, None, '非包管理器安装（如 .run 安装），无法做包校验'
+
+
+def file_check(path):
+    info = dict(path=path, real=os.path.realpath(path), elf=None, size=None, sha256=None)
+    try:
+        with open(info['real'], 'rb') as f:
+            data = f.read(64 << 20)
+        info['elf'] = data[:4] == b'\x7fELF'
+        info['script'] = data[:2] == b'#!'
+        if not info['elf']:
+            head = data[:300].decode('utf-8', 'replace').splitlines()[:3]
+            info['head'] = ' | '.join(re.sub(r'[\x00-\x1f\x7f]', '', h).strip() for h in head if h.strip())
+        info['size'] = len(data)
+        info['sha256'] = hashlib.sha256(data).hexdigest()
+    except Exception as e:
+        info['error'] = str(e)
+    info['pkg'], info['pkg_ver'], info['pkg_ok'], info['pkg_msg'] = pkg_verify(info['real'])
+    return info
+
+
+def loaded_library_path(substr):
+    try:
+        with open('/proc/self/maps') as f:
+            for line in f:
+                if substr in line and '/' in line:
+                    return line[line.index('/'):].strip()
+    except Exception:
+        pass
+    return None
+
+
+# ============================================================================
+# 采集：nvidia-smi（只读查询）
+# ============================================================================
+
+_NA = ('N/A', '[N/A]', 'Unknown Error', '[Unknown Error]', 'Not Supported', '[Not Supported]',
+       'Requested functionality has been deprecated', 'None')
+
+
+def xt(e, path, default=None):
+    if e is None:
+        return default
+    x = e.find(path)
+    if x is None or x.text is None:
+        return default
+    v = x.text.strip()
+    return default if (not v or v in _NA) else v
+
+
+def xfirst(e, paths):
+    for p in paths:
+        v = xt(e, p)
+        if v is not None:
+            return v
+    return None
+
+
+def _sum_unc(e):
+    if e is None:
+        return None
+    total, seen = 0, False
+    for c in e:
+        if 'uncorrectable' in c.tag:
+            v = num((c.text or '').strip())
+            if v is not None:
+                total += int(v)
+                seen = True
+    return total if seen else None
+
+
+def parse_gpu_xml(g):
+    d = dict(
+        bus_id=norm_bdf(g.get('id') or xt(g, 'pci/pci_bus_id')),
+        name=xt(g, 'product_name'), brand=xt(g, 'product_brand'), arch=xt(g, 'product_architecture'),
+        serial=xt(g, 'serial'), uuid=xt(g, 'uuid'), vbios=xt(g, 'vbios_version'),
+        board_pn=xt(g, 'board_part_number'), gpu_pn=xt(g, 'gpu_part_number'),
+        module_id=xfirst(g, ['gpu_module_id', 'module_id', 'platformInfo/module_id']),
+        inforom=xt(g, 'inforom_version/img_version'), gsp=xt(g, 'gsp_firmware_version'),
+        persistence=xt(g, 'persistence_mode'), mig=xt(g, 'mig_mode/current_mig'),
+        compute_mode=xt(g, 'compute_mode'),
+        pci_devid=xt(g, 'pci/pci_device_id'), pci_subsys=xt(g, 'pci/pci_sub_system_id'),
+        link_gen_cur=xt(g, 'pci/pci_gpu_link_info/pcie_gen/current_link_gen'),
+        link_w_cur=xt(g, 'pci/pci_gpu_link_info/link_widths/current_link_width'),
+        replay=num(xt(g, 'pci/replay_counter')),
+        mem_total=num(xt(g, 'fb_memory_usage/total')), mem_used=num(xt(g, 'fb_memory_usage/used')),
+        util=num(xt(g, 'utilization/gpu_util')),
+        ecc=xt(g, 'ecc_mode/current_ecc'), ecc_pending=xt(g, 'ecc_mode/pending_ecc'),
+        ecc_vol_unc=_sum_unc(g.find('ecc_errors/volatile')),
+        ecc_agg_unc=_sum_unc(g.find('ecc_errors/aggregate')),
+        rr_corr=num(xt(g, 'remapped_rows/remapped_row_corr')),
+        rr_unc=num(xt(g, 'remapped_rows/remapped_row_unc')),
+        rr_pending=xt(g, 'remapped_rows/remapped_row_pending'),
+        rr_failure=xt(g, 'remapped_rows/remapped_row_failure'),
+        temp=num(xt(g, 'temperature/gpu_temp')), mem_temp=num(xt(g, 'temperature/memory_temp')),
+        power_draw=num(xfirst(g, ['gpu_power_readings/power_draw', 'gpu_power_readings/instant_power_draw',
+                                  'gpu_power_readings/average_power_draw', 'power_readings/power_draw'])),
+        power_limit=num(xfirst(g, ['gpu_power_readings/current_power_limit',
+                                   'power_readings/enforced_power_limit', 'power_readings/power_limit'])),
+        power_max=num(xfirst(g, ['gpu_power_readings/max_power_limit', 'power_readings/max_power_limit'])),
+        max_sm=num(xfirst(g, ['max_clocks/sm_clock', 'max_clocks/graphics_clock'])),
+        max_mem=num(xt(g, 'max_clocks/mem_clock')),
+        fabric_state=xt(g, 'fabric/state'), fabric_status=xt(g, 'fabric/status'),
+        reset_required=xt(g, 'gpu_reset_status/reset_required'),
+        drain_reset=xt(g, 'gpu_reset_status/drain_and_reset_recommended'),
+        recovery=xt(g, 'gpu_recovery_action'),
+        procs=len(g.findall('processes/process_info')),
+    )
+    thr = []
+    e = g.find('clocks_event_reasons')
+    if e is None:
+        e = g.find('clocks_throttle_reasons')
+    if e is not None:
+        for c in e:
+            if (c.text or '').strip() == 'Active':
+                key = re.sub(r'^clocks_(event|throttle)_reason_', '', c.tag)
+                if key != 'gpu_idle':
+                    thr.append(key)
+    d['throttle'] = thr
+    return d
+
+
+def collect_smi(path):
+    res = {'ok': False, 'error': None, 'gpus': [], 'driver': None, 'cuda': None}
+    if not path:
+        res['error'] = '未找到 nvidia-smi'
+        return res
+    rc, out, err = run([path, '-q', '-x'], 120)
+    if rc != 0 or '<nvidia_smi_log' not in out:
+        res['error'] = first_line(out, err) or ('退出码 %d' % rc)
+        return res
+    try:
+        root = ET.fromstring(out[out.index('<nvidia_smi_log'):])
+    except ET.ParseError as e:
+        res['error'] = 'XML 解析失败：%s' % e
+        return res
+    res['driver'] = xt(root, 'driver_version')
+    res['cuda'] = xt(root, 'cuda_version')
+    for i, g in enumerate(root.findall('gpu')):
+        d = parse_gpu_xml(g)
+        d['index'] = i
+        res['gpus'].append(d)
+    res['ok'] = True
+    return res
+
+
+def collect_proc_gpus():
+    res = {}
+    for bdf in listdir('/proc/driver/nvidia/gpus'):
+        kv = {}
+        for line in (read_text('/proc/driver/nvidia/gpus/%s/information' % bdf, '') or '').splitlines():
+            if ':' in line:
+                k, v = line.split(':', 1)
+                kv[k.strip()] = v.strip()
+        res[norm_bdf(bdf)] = dict(model=kv.get('Model'), uuid=kv.get('GPU UUID'), vbios=kv.get('Video BIOS'),
+                                  excluded=kv.get('GPU Excluded'))
+    return res
+
+
+def collect_topo(smi):
+    res = {'ok': False, 'cols': [], 'rows': {}, 'order': [], 'nic_map': {}, 'error': None}
+    if not smi:
+        return res
+    rc, out, err = run([smi, 'topo', '-m'], 60)
+    lines = [ANSI_RE.sub('', l.rstrip('\n')) for l in out.splitlines()]
+    hi = next((i for i, l in enumerate(lines) if re.search(r'\bGPU0\b', l)), None)
+    if rc != 0 or hi is None:
+        res['error'] = first_line(out, err) or '无输出'
+        return res
+    header = lines[hi]
+    tab = '\t' in header
+    cols = [c.strip() for c in header.split('\t')] if tab else re.split(r'\s{2,}', header.strip())
+    while cols and cols[0] == '':
+        cols.pop(0)
+    for l in lines[hi + 1:]:
+        if not l.strip():
+            break
+        parts = [c.strip() for c in l.split('\t')] if tab else l.split()
+        label, vals = parts[0], parts[1:]
+        res['rows'][label] = dict(zip(cols, vals))
+        res['order'].append(label)
+    for l in lines:
+        m = re.match(r'\s*(NIC\d+)\s*:\s*(\S+)', l)
+        if m:
+            res['nic_map'][m.group(1)] = m.group(2)
+    res['cols'] = cols
+    res['ok'] = True
+    return res
+
+
+def _parse_by_gpu(out):
+    res, cur = {}, None
+    for l in out.splitlines():
+        m = re.match(r'^GPU (\d+): (.*?)(?: \(UUID: (GPU-[0-9a-fA-F-]+)\))?\s*$', l)
+        if m:
+            cur = int(m.group(1))
+            res[cur] = {'name': m.group(2), 'uuid': m.group(3), 'links': {}}
+            continue
+        m = re.match(r'^\s+Link (\d+): (.*)$', l)
+        if m and cur is not None:
+            res[cur]['links'].setdefault(int(m.group(1)), []).append(m.group(2).strip())
+    return res
+
+
+_NVL_ERR_RE = re.compile(r'(replay|recovery|crc|malformed|overrun|rx (remote |general )?errors|integrity|discard)', re.I)
+_NVL_SKIP_RE = re.compile(r'(fec|ber|symbol|successful|packets|bytes)', re.I)
+
+
+def collect_nvlink(smi):
+    res = {'status': {}, 'errors': {}, 'error': None}
+    if not smi:
+        return res
+    rc, out, err = run([smi, 'nvlink', '-s'], 60)          # 只读：链路状态/速率
+    if rc == 0:
+        res['status'] = _parse_by_gpu(out)
+    else:
+        res['error'] = first_line(out, err)
+    rc, out, err = run([smi, 'nvlink', '-e'], 60)          # 只读：错误计数（不重置）
+    if rc == 0:
+        for gi, info in _parse_by_gpu(out).items():
+            total = 0
+            for vals in info['links'].values():
+                for v in vals:
+                    m = re.match(r'(.+?):\s*(\d+)\s*$', v)
+                    if m and _NVL_ERR_RE.search(m.group(1)) and not _NVL_SKIP_RE.search(m.group(1)):
+                        total += int(m.group(2))
+            res['errors'][gi] = total
+    return res
+
+
+def _pkg_version(patterns):
+    if which('dpkg-query'):
+        rc, out, _ = run(['dpkg-query', '-W', '-f', '${db:Status-Abbrev} ${Package} ${Version}\n'] + patterns, 20)
+        for line in out.splitlines():
+            p = line.split()
+            if len(p) >= 3 and p[0].startswith('ii'):
+                return p[1], p[2]
+    if which('rpm'):
+        rc, out, _ = run(['rpm', '-qa', '--qf', '%{NAME} %{VERSION}-%{RELEASE}\n'] + patterns, 30)
+        for line in out.splitlines():
+            p = line.split()
+            if len(p) >= 2:
+                return p[0], p[1]
+    return None, None
+
+
+def collect_fm():
+    fm = {'load': None, 'active': None, 'sub': None, 'version': None}
+    sc = which('systemctl')
+    if sc:
+        _, out, _ = run([sc, 'show', 'nvidia-fabricmanager', '-p', 'LoadState', '-p', 'ActiveState',
+                         '-p', 'SubState', '--no-pager'], 15)
+        kv = dict(l.split('=', 1) for l in out.splitlines() if '=' in l)
+        fm.update(load=kv.get('LoadState'), active=kv.get('ActiveState'), sub=kv.get('SubState'))
+    _, fm['version'] = _pkg_version(['nvidia-fabricmanager*', 'nvidia-fabric-manager*', 'cuda-drivers-fabricmanager*'])
+    return fm
+
+
+# ============================================================================
+# 采集：NVML 直连（ctypes 调用 libnvidia-ml，绕过 nvidia-smi 程序，只读）
+# ============================================================================
+
+class _NvmlPciInfo(ctypes.Structure):
+    _fields_ = [('busIdLegacy', ctypes.c_char * 16), ('domain', ctypes.c_uint), ('bus', ctypes.c_uint),
+                ('device', ctypes.c_uint), ('pciDeviceId', ctypes.c_uint), ('pciSubSystemId', ctypes.c_uint),
+                ('busId', ctypes.c_char * 32)]
+
+
+class _NvmlMemory(ctypes.Structure):
+    _fields_ = [('total', ctypes.c_ulonglong), ('free', ctypes.c_ulonglong), ('used', ctypes.c_ulonglong)]
+
+
+def _cs(buf):
+    """ctypes 字符串缓冲区或结构体 char[] 字段（后者直接是 bytes）转 str"""
+    try:
+        v = buf.value if hasattr(buf, 'value') else buf
+        return v.decode('utf-8', 'replace').strip() or None
+    except Exception:
+        return None
+
+
+def collect_nvml(libname):
+    res = {'ok': False, 'error': None, 'gpus': {}, 'lib': None, 'driver': None}
+    try:
+        lib = ctypes.CDLL(libname)
+    except OSError:
+        res['error'] = '无法加载 %s' % libname
+        return res
+
+    def fn(name):
+        f = getattr(lib, name, None)
+        if f is not None:
+            f.restype = ctypes.c_int
+        return f
+
+    init = fn('nvmlInit_v2') or fn('nvmlInit')
+    if init is None:
+        res['error'] = 'NVML 库缺少 nvmlInit'
+        return res
+    rc = init()
+    if rc != 0:
+        res['error'] = 'nvmlInit 失败（错误码 %d）' % rc
+        return res
+    byref, c_uint, c_int = ctypes.byref, ctypes.c_uint, ctypes.c_int
+    try:
+        res['lib'] = loaded_library_path('libnvidia-ml') or libname
+        buf = ctypes.create_string_buffer(96)
+        f = fn('nvmlSystemGetDriverVersion')
+        if f and f(buf, c_uint(96)) == 0:
+            res['driver'] = _cs(buf)
+        cnt = c_uint(0)
+        f = fn('nvmlDeviceGetCount_v2') or fn('nvmlDeviceGetCount')
+        if f is None or f(byref(cnt)) != 0:
+            res['error'] = 'nvmlDeviceGetCount 失败'
+            return res
+        get_handle = fn('nvmlDeviceGetHandleByIndex_v2') or fn('nvmlDeviceGetHandleByIndex')
+        for i in range(cnt.value):
+            h = ctypes.c_void_p()
+            if get_handle(c_uint(i), byref(h)) != 0:
+                continue
+            g = {'index': i}
+
+            def sbuf(fname, size):
+                b = ctypes.create_string_buffer(size)
+                ff = fn(fname)
+                return _cs(b) if (ff and ff(h, b, c_uint(size)) == 0) else None
+
+            def uint(fname, *pre):
+                v = c_uint(0)
+                ff = fn(fname)
+                return v.value if (ff and ff(h, *(pre + (byref(v),))) == 0) else None
+
+            g['name'] = sbuf('nvmlDeviceGetName', 96)
+            g['serial'] = sbuf('nvmlDeviceGetSerial', 64)
+            g['uuid'] = sbuf('nvmlDeviceGetUUID', 96)
+            pci = _NvmlPciInfo()
+            f = fn('nvmlDeviceGetPciInfo_v3') or fn('nvmlDeviceGetPciInfo_v2')
+            if f and f(h, byref(pci)) == 0:
+                g['bus_id'] = norm_bdf(_cs(pci.busId) or _cs(pci.busIdLegacy))
+                g['pci_devid'] = pci.pciDeviceId
+                g['pci_subsys'] = pci.pciSubSystemId
+            mem = _NvmlMemory()
+            f = fn('nvmlDeviceGetMemoryInfo')
+            if f and f(h, byref(mem)) == 0:
+                g['mem_total'] = mem.total
+            g['cores'] = uint('nvmlDeviceGetNumGpuCores')
+            g['bus_width'] = uint('nvmlDeviceGetMemoryBusWidth')
+            g['max_sm'] = uint('nvmlDeviceGetMaxClockInfo', c_int(1))     # NVML_CLOCK_SM
+            g['max_mem'] = uint('nvmlDeviceGetMaxClockInfo', c_int(2))    # NVML_CLOCK_MEM
+            mn, mx = c_uint(0), c_uint(0)
+            f = fn('nvmlDeviceGetPowerManagementLimitConstraints')
+            if f and f(h, byref(mn), byref(mx)) == 0:
+                g['power_max'] = mx.value / 1000.0
+            ma, mi = c_int(0), c_int(0)
+            f = fn('nvmlDeviceGetCudaComputeCapability')
+            if f and f(h, byref(ma), byref(mi)) == 0:
+                g['cc'] = '%d.%d' % (ma.value, mi.value)
+            links = {}
+            f_state = fn('nvmlDeviceGetNvLinkState')
+            f_rtype = fn('nvmlDeviceGetNvLinkRemoteDeviceType')
+            f_rpci = fn('nvmlDeviceGetNvLinkRemotePciInfo_v2')
+            if f_state:
+                for ln in range(18):
+                    act = c_int(0)
+                    if f_state(h, c_uint(ln), byref(act)) != 0:
+                        continue
+                    lk = {'active': bool(act.value)}
+                    if act.value:
+                        rt = c_int(-1)
+                        if f_rtype and f_rtype(h, c_uint(ln), byref(rt)) == 0:
+                            lk['rtype'] = rt.value          # 0=GPU 1=IBMNPU 2=NVSwitch
+                        rp = _NvmlPciInfo()
+                        if f_rpci and f_rpci(h, c_uint(ln), byref(rp)) == 0:
+                            lk['remote'] = norm_bdf(_cs(rp.busId) or _cs(rp.busIdLegacy))
+                    links[ln] = lk
+            g['nvlinks'] = links
+            if g.get('bus_id'):
+                res['gpus'][g['bus_id']] = g
+        res['ok'] = True
+    finally:
+        f = fn('nvmlShutdown')
+        if f:
+            f()
+    return res
+
+
+# ============================================================================
+# 采集：CUDA 设备属性（可选 --cuda；cuInit + cuDeviceGetAttribute，不创建上下文、不占显存）
+# ============================================================================
+
+CUDA_ERR = {100: '没有可用 GPU', 101: '设备无效', 802: '系统未就绪，NVSwitch 机器通常是 Fabric Manager 未运行',
+            803: '驱动版本不匹配', 999: '未知错误'}
+
+
+def collect_cuda(libname):
+    res = {'ok': False, 'error': None, 'gpus': {}}
+    os.environ.pop('CUDA_VISIBLE_DEVICES', None)      # 仅影响本进程
+    try:
+        lib = ctypes.CDLL(libname)
+    except OSError:
+        res['error'] = '无法加载 %s' % libname
+        return res
+    for name in ('cuInit', 'cuDeviceGetCount', 'cuDeviceGet', 'cuDeviceGetName', 'cuDeviceGetAttribute',
+                 'cuDeviceGetPCIBusId'):
+        f = getattr(lib, name, None)
+        if f is None:
+            res['error'] = 'libcuda 缺少 %s' % name
+            return res
+        f.restype = ctypes.c_int
+    rc = lib.cuInit(0)
+    if rc != 0:
+        res['error'] = 'cuInit 失败（错误码 %d%s）' % (rc, '，' + CUDA_ERR[rc] if rc in CUDA_ERR else '')
+        return res
+    n = ctypes.c_int(0)
+    lib.cuDeviceGetCount(ctypes.byref(n))
+    for i in range(n.value):
+        d = ctypes.c_int(0)
+        if lib.cuDeviceGet(ctypes.byref(d), i) != 0:
+            continue
+
+        def attr(a):
+            v = ctypes.c_int(0)
+            return v.value if lib.cuDeviceGetAttribute(ctypes.byref(v), a, d.value) == 0 else None
+
+        name = ctypes.create_string_buffer(256)
+        lib.cuDeviceGetName(name, 256, d.value)
+        bus = ctypes.create_string_buffer(64)
+        lib.cuDeviceGetPCIBusId(bus, 64, d.value)
+        g = dict(name=_cs(name), sm=attr(16), bus_width=attr(37), l2=attr(38),
+                 cc='%s.%s' % (attr(75), attr(76)))
+        bdf = norm_bdf(_cs(bus))
+        if bdf:
+            res['gpus'][bdf] = g
+    res['ok'] = True
+    return res
+
+
+# ============================================================================
+# 采集：IB / RDMA 网卡、其它网卡、OFED
+# ============================================================================
+
+def parse_vpd(data):
+    out, i = {}, 0
+    while i < len(data):
+        tag = data[i]
+        if tag & 0x80:
+            if i + 3 > len(data):
+                break
+            ln = data[i + 1] | (data[i + 2] << 8)
+            body = data[i + 3:i + 3 + ln]
+            name = tag & 0x7f
+            if name == 0x02:
+                out['ID'] = body.decode('ascii', 'replace').strip('\x00 ').strip()
+            elif name in (0x10, 0x11):
+                j = 0
+                while j + 3 <= len(body):
+                    kw = body[j:j + 2].decode('ascii', 'replace')
+                    kl = body[j + 2]
+                    if kw in ('PN', 'SN', 'EC', 'MN'):
+                        out[kw] = body[j + 3:j + 3 + kl].decode('ascii', 'replace').strip('\x00 ').strip()
+                    j += 3 + kl
+            i += 3 + ln
+        else:
+            if (tag >> 3) & 0x0f == 0x0f:      # 结束标记
+                out['_end'] = True
+                break
+            i += 1 + (tag & 0x07)
+    return out
+
+
+def read_vpd(bdf):
+    """读取网卡 VPD（型号描述/料号/序列号），需要 root；分块读取，读到结束标记即停止"""
+    try:
+        data = b''
+        with open(P('/sys/bus/pci/devices/%s/vpd' % bdf), 'rb') as f:
+            while len(data) < 4096:
+                chunk = f.read(256)
+                if not chunk:
+                    break
+                data += chunk
+                if parse_vpd(data).get('_end'):
+                    break
+        return parse_vpd(data)
+    except Exception:
+        return {}
+
+
+def _strip_state(v):
+    return re.sub(r'^\d+:\s*', '', v) if v else v
+
+
+def collect_ib(pci):
+    hcas = []
+    for dev in listdir('/sys/class/infiniband'):
+        base = '/sys/class/infiniband/' + dev
+        bdf = link_name(base + '/device')
+        p = pci.get(bdf) or {}
+        h = dict(dev=dev, bdf=bdf, fw=read_text(base + '/fw_ver'), hca_type=read_text(base + '/hca_type'),
+                 psid=read_text(base + '/board_id'), node_guid=read_text(base + '/node_guid'),
+                 device=p.get('device'), vendor=p.get('vendor'), numa=p.get('numa'), is_vf=p.get('is_vf'),
+                 link=fmt_link(p.get('cur_speed'), p.get('cur_width')),
+                 link_max=fmt_link(p.get('max_speed'), p.get('max_width')),
+                 cur_gen=pcie_gen(p.get('cur_speed')), max_gen=pcie_gen(p.get('max_speed')),
+                 cur_w=p.get('cur_width'), max_w=p.get('max_width'))
+        h['model'] = MLX_DB.get(p.get('device')) or h['hca_type'] or '-'
+        h['netdevs'] = listdir(base + '/device/net')
+        ports = []
+        for port in listdir(base + '/ports'):
+            pb = '%s/ports/%s' % (base, port)
+            cnt = {}
+            for cn in ('symbol_error', 'port_rcv_errors', 'link_downed', 'link_error_recovery',
+                       'local_link_integrity_errors', 'excessive_buffer_overrun_errors'):
+                v = read_int(pb + '/counters/' + cn)
+                if v is not None:
+                    cnt[cn] = v
+            ports.append(dict(port=port, state=_strip_state(read_text(pb + '/state')),
+                              phys=_strip_state(read_text(pb + '/phys_state')), rate=read_text(pb + '/rate'),
+                              link_layer=read_text(pb + '/link_layer'), lid=read_text(pb + '/lid'),
+                              sm_lid=read_text(pb + '/sm_lid'), counters=cnt))
+        h['ports'] = ports
+        h['vpd'] = read_vpd(bdf) if (G.is_root and bdf and p.get('vendor') == 0x15b3) else {}
+        hcas.append(h)
+    return hcas
+
+
+def collect_eth(pci, skip_netdevs):
+    nics, vfs = [], 0
+    for ifn in listdir('/sys/class/net'):
+        base = '/sys/class/net/' + ifn
+        if not exists(base + '/device') or ifn in skip_netdevs:
+            continue
+        if exists(base + '/device/physfn'):
+            vfs += 1
+            continue
+        bdf = link_name(base + '/device')
+        p = pci.get(bdf) or {}
+        speed = read_int(base + '/speed')
+        nics.append(dict(ifname=ifn, bdf=bdf, driver=link_name(base + '/device/driver'),
+                         speed=speed if speed and speed > 0 else None, state=read_text(base + '/operstate'),
+                         mtu=read_text(base + '/mtu'), numa=p.get('numa'), vendor=p.get('vendor'),
+                         device=p.get('device'), type=read_text(base + '/type')))
+    return nics, vfs
+
+
+def collect_ofed():
+    o = {'ofed': None}
+    oi = which('ofed_info')
+    if oi:
+        rc, out, _ = run([oi, '-s'], 15)
+        if rc == 0 and out.strip():
+            o['ofed'] = first_line(out).rstrip(':')
+    o['mlx5_ver'] = read_text('/sys/module/mlx5_core/version')
+    return o
+
+
+def collect_xid():
+    res = {'ok': False, 'src': None, 'xid': [], 'sxid': 0, 'error': None}
+    rc, out, _ = run([which('dmesg') or 'dmesg'], 20)
+    res['src'] = 'dmesg'
+    if rc != 0 or not out.strip():
+        jc = which('journalctl')
+        if jc:
+            rc, out, _ = run([jc, '-k', '-b', '--no-pager', '-o', 'cat'], 40)
+            res['src'] = 'journalctl -k -b'
+    if rc != 0:
+        res['error'] = '无法读取内核日志（通常需要 root）'
+        return res
+    for line in out.splitlines():
+        m = re.search(r'NVRM: Xid \(PCI:([0-9a-fA-F]{4,8}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2})\): (\d+)', line)
+        if m:
+            dom, bus, dev = m.group(1).split(':')
+            res['xid'].append(('%04x:%s:%s' % (int(dom, 16), bus.lower(), dev.lower()), int(m.group(2))))
+        elif 'SXid' in line and 'nvswitch' in line.lower():
+            res['sxid'] += 1
+    res['ok'] = True
+    return res
+
+
+# ============================================================================
+# 汇总每张 GPU 的多源数据
+# ============================================================================
+
+def assemble_gpus(ctx):
+    pci, smi, nv = ctx['pci'], ctx['smi'], ctx['nvml']
+    cu = ctx.get('cuda') or {}
+    smi_by = dict((g['bus_id'], g) for g in smi.get('gpus', []) if g.get('bus_id'))
+    nv_by, cu_by, proc = nv.get('gpus', {}), cu.get('gpus', {}), ctx['proc']
+    bdfs = set(b for b, p in pci.items() if is_nv_gpu(p))
+    bdfs.update(smi_by)
+    bdfs.update(nv_by)
+    bdfs.update(proc)
+    gpus = []
+    for b in sorted(bdfs):
+        p = pci.get(b) if is_nv_gpu(pci.get(b)) else None
+        rec = dict(bdf=b, pci=p, smi=smi_by.get(b), nvml=nv_by.get(b), cuda=cu_by.get(b), proc=proc.get(b))
+        devid = p['device'] if p else None
+        if devid is None and rec['smi'] and rec['smi'].get('pci_devid'):
+            try:
+                devid = int(rec['smi']['pci_devid'][:4], 16)
+            except ValueError:
+                pass
+        rec['devid'] = devid
+        rec['db'] = GPU_DB.get(devid)
+        rec['cfg'] = read_cfg_ids(b) if p else None
+        rec['idx'] = rec['smi']['index'] if rec['smi'] else (rec['nvml']['index'] if rec['nvml'] else None)
+        gpus.append(rec)
+    if all(g['idx'] is None for g in gpus):
+        for i, g in enumerate(gpus):
+            g['idx'] = i
+    gpus.sort(key=lambda g: (g['idx'] is None, g['idx'] if g['idx'] is not None else 0, g['bdf']))
+    # NVLink 汇总：优先 nvidia-smi nvlink -s，其次 NVML
+    nvl = ctx['nvlink']
+    for g in gpus:
+        st = nvl['status'].get(g['idx']) if g['idx'] is not None else None
+        info = None
+        if st and st['links']:
+            act, inact, speeds = [], [], []
+            for ln, vals in sorted(st['links'].items()):
+                v = ' '.join(vals)
+                m = re.search(r'([\d.]+)\s*GB/s', v)
+                if m and 'inactive' not in v.lower():
+                    act.append(ln)
+                    speeds.append(float(m.group(1)))
+                else:
+                    inact.append(ln)
+            info = dict(total=len(st['links']), active=len(act), inactive=inact, speeds=speeds)
+        elif g['nvml'] and g['nvml'].get('nvlinks'):
+            lk = g['nvml']['nvlinks']
+            info = dict(total=len(lk), active=sum(1 for v in lk.values() if v['active']),
+                        inactive=[k for k, v in sorted(lk.items()) if not v['active']], speeds=[])
+        if info is not None:
+            info['errors'] = nvl['errors'].get(g['idx'])
+        g['nvl'] = info
+    return gpus
+
+
+# ============================================================================
+# 判定
+# ============================================================================
+
+def expect_check(db, expect):
+    fam, form, sku = db['family'], db['form'], db['sku']
+    if expect == 'any':
+        return OK, '硬件识别为 %s' % sku
+    if fam == 'H100':
+        want = {'h100-sxm': ('SXM', 'SXM5'), 'h100-pcie': ('PCIe', 'PCIe'), 'h100-nvl': ('NVL', 'NVL')}.get(expect)
+        if want and not form.startswith(want[0]):
+            return FAIL, '实为 %s，与期望的 H100 %s 版不符' % (sku, want[1])
+        return OK, '硬件识别为 %s' % sku
+    if fam in ('H20', 'H800'):
+        return FAIL, '实为 %s，不是 H100 —— %s' % (sku, db['note'])
+    if fam in ('H200', 'GH200'):
+        return WARN, '实为 %s，不是 H100（规格高于 H100）' % sku
+    if fam == 'GH100?':
+        return WARN, '设备 ID 属于 GH100 但%s' % db['note'].replace('未命名的 GH100 设备 ID，', '')
+    return FAIL, '实为 %s，不是 H100' % sku
+
+
+def evaluate_gpu(g, expect):
+    checks = []
+
+    def add(key, level, value, detail=''):
+        checks.append(dict(key=key, level=level, value=value, detail=detail))
+
+    p, db, smi, nv, pr, cu = g['pci'], g['db'], g['smi'], g['nvml'], g['proc'], g['cuda']
+    devid = g['devid']
+    hwfam = db['family'] if db else None
+    mig = smi and smi.get('mig') == 'Enabled'
+
+    # 1. 硬件设备 ID（PCI 配置空间，芯片熔丝决定）
+    if p is None:
+        add('hwid', WARN, '-', 'sysfs 中找不到该 GPU 的 PCI 设备，无法做硬件 ID 核验')
+    elif db is None:
+        add('hwid', WARN, '0x%04x' % devid, '设备 ID 0x%04x 不在内置型号库中（可能是工程样品或新型号）' % devid)
+    else:
+        lvl, why = expect_check(db, expect)
+        add('hwid', lvl, '0x%04x' % devid, why)
+    # 2. 实时配置空间 vs 内核缓存值
+    cfg = g['cfg']
+    if p and cfg:
+        if cfg['vendor'] == 0xffff:
+            add('cfg', WARN, '无响应', 'PCI 配置空间读回 0xFFFF，GPU 可能已掉卡或正在复位')
+        elif (cfg['vendor'], cfg['device']) != (p['vendor'], p['device']):
+            add('cfg', FAIL, '不一致', '实时读取的设备 ID 0x%04x 与内核缓存值 0x%04x 不一致（疑似内核级伪造）'
+                % (cfg['device'], p['device']))
+    # 3. 名称一致性：nvidia-smi / NVML / 驱动 /proc / CUDA 都要与硬件 ID 同一型号家族
+    srcs = [('nvidia-smi', smi and smi.get('name')), ('NVML', nv and nv.get('name')),
+            ('驱动(/proc)', pr and pr.get('model')), ('CUDA', cu and cu.get('name'))]
+    names = [(src, nm) for src, nm in srcs if nm]
+    if not names:
+        add('names', WARN, '无数据', '驱动未加载或 nvidia-smi/NVML 不可用，只完成了硬件 ID 核验')
+    elif hwfam in KNOWN_FAMILIES:
+        bad = ['%s 报告“%s”' % (src, nm) for src, nm in names if family_of(nm) != hwfam]
+        if bad:
+            add('names', FAIL, '不一致', '型号名称与硬件 ID（%s）不符：%s —— 疑似 nvidia-smi/驱动被篡改'
+                % (db['sku'], '；'.join(bad)))
+        else:
+            add('names', OK, '一致', '、'.join(src for src, _ in names) + ' 均为 ' + hwfam)
+    else:
+        add('names', INFO, '-', '名称：' + '；'.join('%s=%s' % x for x in names))
+    for src, nm in names:
+        if 'Graphics Device' in nm:
+            add('es', WARN, nm, '%s 显示为“%s”（驱动不认识的设备，可能是工程样品）' % (src, nm))
+            break
+    # 4. 软件层上报的 PCI ID 是否与硬件一致
+    if p:
+        hw_pair = (p['device'], p['vendor'])
+        bad = []
+        if smi and smi.get('pci_devid'):
+            try:
+                v = int(smi['pci_devid'], 16)
+                if (v >> 16, v & 0xffff) != hw_pair:
+                    bad.append('nvidia-smi 上报设备 ID 0x%04x' % (v >> 16))
+            except ValueError:
+                pass
+            if smi.get('pci_subsys') and p.get('sdevice') is not None:
+                try:
+                    v = int(smi['pci_subsys'], 16)
+                    if v >> 16 != p['sdevice']:
+                        bad.append('nvidia-smi 上报子系统 ID 0x%04x（硬件 0x%04x）' % (v >> 16, p['sdevice']))
+                except ValueError:
+                    pass
+        if nv and nv.get('pci_devid') is not None:
+            v = nv['pci_devid']
+            if (v >> 16, v & 0xffff) != hw_pair:
+                bad.append('NVML 上报设备 ID 0x%04x' % (v >> 16))
+        if bad:
+            add('swid', FAIL, '不一致', '软件上报的 PCI ID 与硬件 0x%04x 不符：%s —— 疑似篡改'
+                % (p['device'], '；'.join(bad)))
+    # 5. SM 数（NVML 核心数/128，或 --cuda 的 SM 数）
+    sm, sm_src = None, None
+    if cu and cu.get('sm') and not mig:
+        sm, sm_src = cu['sm'], 'CUDA'
+    elif nv and nv.get('cores') and db and db['arch'] == 'Hopper':
+        sm, sm_src = nv['cores'] // 128, 'NVML'
+    exp = db and db.get('sms')
+    if sm is None:
+        add('sm', INFO, '-', '驱动未提供 SM 数（可加 --cuda 读取）')
+    elif not exp:
+        add('sm', INFO, str(sm), '')
+    elif sm == exp:
+        add('sm', OK, str(sm), '')
+    else:
+        add('sm', FAIL if db['strict'] else WARN, str(sm),
+            'SM 数 %d（%s）与 %s 标准值 %d 不符' % (sm, sm_src, db['sku'], exp))
+    # 6. 显存位宽
+    bw = (nv and nv.get('bus_width')) or (cu and cu.get('bus_width'))
+    exp = db and db.get('bus')
+    if not bw:
+        add('bus', INFO, '-', '')
+    elif not exp or bw == exp:
+        add('bus', OK if exp else INFO, str(bw), '')
+    else:
+        add('bus', FAIL if db['strict'] else WARN, str(bw),
+            '显存位宽 %d-bit 与 %s 标准值 %d-bit 不符' % (bw, db['sku'], exp))
+    # 7. 显存容量（优先取 NVML 直连值：nvidia-smi 程序本身可能被替换）
+    mib_nv = nv['mem_total'] / 1048576.0 if (nv and nv.get('mem_total')) else None
+    mib_smi = smi and smi.get('mem_total')
+    mib = mib_nv or mib_smi
+    exp = db and db.get('mem')
+    if not mib:
+        add('mem', INFO, '-', '')
+    else:
+        gib = mib / 1024.0
+        if not exp:
+            add('mem', INFO, '%.1fGiB' % gib, '')
+        elif abs(gib - exp) / float(exp) <= 0.06:
+            add('mem', OK, '%.1fGiB' % gib, '')
+        else:
+            add('mem', FAIL, '%.1fGiB' % gib, '显存 %.1f GiB 与 %s 标称 %d GB 不符' % (gib, db['sku'], exp))
+    # 8. 最大功耗墙（VBIOS 决定）
+    p_nv, p_smi = nv and nv.get('power_max'), smi and smi.get('power_max')
+    pmax = p_nv or p_smi
+    exp = db and db.get('maxw')
+    if not pmax:
+        add('power', INFO, '-', '')
+    elif not exp or abs(pmax - exp) <= exp * 0.03:
+        add('power', OK if exp else INFO, '%dW' % pmax, '')
+    else:
+        add('power', WARN, '%dW' % pmax, '最大功耗墙 %d W 与 %s 标准值 %d W 不符（VBIOS 非标准或型号不符）'
+            % (pmax, db['sku'], exp))
+    # 9. 最大频率
+    msm = (nv and nv.get('max_sm')) or (smi and smi.get('max_sm'))
+    mmem = (nv and nv.get('max_mem')) or (smi and smi.get('max_mem'))
+    bad = []
+    if db and db.get('maxsm') and msm and abs(msm - db['maxsm']) > db['maxsm'] * 0.02:
+        bad.append('SM %d MHz（标准 %d）' % (msm, db['maxsm']))
+    if db and db.get('maxmem') and mmem and abs(mmem - db['maxmem']) > db['maxmem'] * 0.02:
+        bad.append('显存 %d MHz（标准 %d）' % (mmem, db['maxmem']))
+    clk = '%s/%s' % (s(msm and int(msm)), s(mmem and int(mmem))) if (msm or mmem) else '-'
+    if bad:
+        add('clock', WARN, clk, '最大频率与 %s 不符：%s' % (db['sku'], '，'.join(bad)))
+    else:
+        add('clock', OK if (db and db.get('maxsm') and msm) else INFO, clk, '')
+    # nvidia-smi 与 NVML 直连的数值必须一致（同一份驱动数据，差异只能来自篡改）
+    diffs = []
+    if mib_nv and mib_smi and abs(mib_nv - mib_smi) > 0.03 * mib_nv:
+        diffs.append('显存 %d/%d MiB' % (mib_smi, mib_nv))
+    if p_nv and p_smi and abs(p_nv - p_smi) > 0.02 * p_nv:
+        diffs.append('最大功耗墙 %d/%d W' % (p_smi, p_nv))
+    for key, label in (('max_sm', '最大 SM 频率'), ('max_mem', '最大显存频率')):
+        a, b = smi and smi.get(key), nv and nv.get(key)
+        if a and b and abs(a - b) > 0.02 * b:
+            diffs.append('%s %d/%d MHz' % (label, a, b))
+    if smi and nv and smi.get('serial') and nv.get('serial') and smi['serial'] != nv['serial']:
+        diffs.append('序列号 %s/%s' % (smi['serial'], nv['serial']))
+    if diffs:
+        add('smi_nvml', FAIL, '不一致', 'nvidia-smi 与 NVML 直连数据不一致（前者/后者）：%s —— nvidia-smi 输出疑似被篡改'
+            % '；'.join(diffs))
+    # 10. NVLink 链路
+    nl = g.get('nvl')
+    exp = db and db.get('links')
+    if not nl:
+        no_drv = not smi and not nv
+        add('nvlink', WARN if (exp and not no_drv) else INFO, '-', '' if no_drv else ('无法读取 NVLink 状态' if exp else ''))
+    else:
+        val = '%d/%d' % (nl['active'], nl['total'])
+        if exp and nl['total'] < exp:
+            add('nvlink', WARN, val, '只有 %d 条 NVLink 链路（%s 应为 %d 条）' % (nl['total'], db['sku'], exp))
+        elif nl['inactive'] and nl['active'] == 0:
+            add('nvlink', WARN, val, 'NVLink 全部未激活（NVSwitch 机器请检查 nvidia-fabricmanager）')
+        elif nl['inactive']:
+            add('nvlink', WARN, val, 'NVLink 链路 %s 未激活（属健康问题，非真伪问题）'
+                % ','.join(str(x) for x in nl['inactive']))
+        else:
+            add('nvlink', OK if exp else INFO, val, '')
+    # 11. GPU 部件号前缀应等于设备 ID（如 2330-885-A1）
+    pn = smi and smi.get('gpu_pn')
+    if pn and devid is not None and re.match(r'^[0-9A-Fa-f]{4}-', pn):
+        if pn[:4].lower() != '%04x' % devid:
+            add('partno', WARN, pn, 'GPU 部件号 %s 与硬件设备 ID 0x%04x 不对应' % (pn, devid))
+        else:
+            add('partno', OK, pn, '')
+    # 12. 架构 / 计算能力
+    if db and db['arch'] == 'Hopper':
+        bad = []
+        if smi and smi.get('arch') and smi['arch'].lower() != 'hopper':
+            bad.append('nvidia-smi 架构=%s' % smi['arch'])
+        for src, rec in (('NVML', nv), ('CUDA', cu)):
+            if rec and rec.get('cc') and not rec['cc'].startswith('9.'):
+                bad.append('%s 计算能力=%s' % (src, rec['cc']))
+        if bad:
+            add('arch', FAIL, '不一致', 'Hopper 芯片却上报 %s —— 疑似篡改' % '；'.join(bad))
+
+    g['checks'] = checks
+    by = dict((c['key'], c) for c in checks)
+    critical = [c for c in checks if c['key'] in ('hwid', 'cfg', 'names', 'swid', 'smi_nvml', 'sm', 'bus', 'mem',
+                                                   'arch', 'es')]
+    worst_crit = max([c['level'] for c in critical] or [OK])
+    worst_all = max([c['level'] for c in checks] or [OK])
+    short = db['sku'].rsplit(' ', 1)[0] if db and re.search(r'\d+GB$', db['sku']) else (db['sku'] if db else '?')
+    if by.get('hwid', {}).get('level') == FAIL:
+        g['verdict'] = (FAIL, ('形态不符: ' if hwfam == 'H100' else '非H100: ') + (short if db else '?'))
+    elif worst_crit == FAIL:
+        g['verdict'] = (FAIL, '存疑: 数据矛盾')
+    elif worst_crit == WARN:
+        g['verdict'] = (WARN, '待确认' if hwfam != 'H200' and hwfam != 'GH200' else '非H100: ' + short)
+    elif worst_all >= WARN:
+        g['verdict'] = (WARN, '真 %s(有告警)' % short)
+    else:
+        g['verdict'] = (OK, '真 ' + short)
+    g['auth'] = OK if g['verdict'][1].startswith('真 ') else g['verdict'][0]
+    return g
+
+
+def evaluate(ctx, args):
+    F = Findings.add
+    gpus = ctx['gpus']
+    pci = ctx['pci']
+    for g in gpus:
+        try:
+            evaluate_gpu(g, args.expect)
+        except Exception as e:
+            ERRORS.append('GPU %s 判定：%s: %s' % (g.get('idx'), type(e).__name__, e))
+            g.setdefault('checks', [dict(key='hwid', level=WARN, value='-', detail='判定出错')])
+            g['verdict'] = (WARN, '检测出错')
+            g['auth'] = WARN
+
+    # ---------------- 真伪
+    if not gpus:
+        F('真伪', FAIL, '未发现任何 NVIDIA GPU')
+    groups = {}
+    for g in gpus:
+        for c in g['checks']:
+            if c['level'] >= WARN:
+                cat = '真伪' if c['key'] not in ('nvlink',) else 'NVLink'
+                groups.setdefault((cat, c['level'], c['detail']), []).append(g['idx'])
+    for (cat, lvl, detail), ids in sorted(groups.items(), key=lambda x: (-x[0][1], x[0][0])):
+        F(cat, lvl, 'GPU %s：%s' % (compress_ids(ids), detail))
+    verdicts = Counter(g['verdict'][1] for g in gpus)
+    ctx['verdicts'] = verdicts
+
+    # ---------------- 工具链
+    drv, smi, nv = ctx['drv'], ctx['smi'], ctx['nvml']
+    files = ctx['smi_files']
+    if not files:
+        if any(is_nv_gpu(p) for p in pci.values()):
+            F('工具链', WARN, '未找到 nvidia-smi（驱动未安装？），只能做硬件 ID 核验')
+    else:
+        f0 = files[0]
+        if G.test_mode:
+            pass
+        elif f0.get('elf') is False:
+            F('工具链', WARN, '%s 不是 ELF 可执行文件（%s），可能被包装或替换，请人工查看其内容：%s'
+              % (f0['path'], '脚本' if f0.get('script') else '未知格式', clip(f0.get('head') or '-', 120)))
+        if f0.get('pkg_ok') is False:
+            run_ver = drv.get('kmod_version') or smi.get('driver')
+            pv = f0.get('pkg_ver') or ''
+            if run_ver and pv and not pv.split(':')[-1].startswith(run_ver):
+                F('工具链', WARN, 'nvidia-smi 与软件包 %s（版本 %s）校验不一致，而当前驱动为 %s：'
+                  '多半是用 .run 安装包覆盖了包管理器安装的驱动，建议人工确认（%s）'
+                  % (f0['pkg'], pv, run_ver, f0['path']))
+            else:
+                F('工具链', FAIL, 'nvidia-smi 包校验不通过：%s，且版本相同 —— 文件在安装后被修改（%s）'
+                  % (f0['pkg_msg'], f0['path']))
+        if len(files) > 1:
+            F('工具链', WARN, 'PATH 中存在多个 nvidia-smi：%s（请确认来源）' % '、'.join(f['path'] for f in files))
+    if files and not smi['ok']:
+        F('工具链', WARN, 'nvidia-smi 执行失败：%s' % smi['error'])
+    vers = {}
+    if drv.get('kmod_version'):
+        vers['内核模块'] = drv['kmod_version']
+    if smi.get('driver'):
+        vers['nvidia-smi'] = smi['driver']
+    if nv.get('driver'):
+        vers['NVML'] = nv['driver']
+    m = re.search(r'\.so\.(\d+\.\d+(?:\.\d+)?)$', os.path.realpath(nv['lib'])) if nv.get('lib') else None
+    if m:
+        vers['libnvidia-ml'] = m.group(1)
+    ctx['versions'] = vers
+    kv_ = vers.get('内核模块')
+    forged = [k for k in ('nvidia-smi', 'NVML') if kv_ and vers.get(k) and vers[k] != kv_]
+    if forged:
+        F('工具链', FAIL, '驱动版本不一致：%s（%s 上报的版本与已加载的内核模块不同却能正常工作，输出疑似被伪造）'
+          % ('，'.join('%s=%s' % x for x in vers.items()), '、'.join(forged)))
+    elif len(set(vers.values())) > 1:
+        F('工具链', WARN, '驱动组件版本不一致：%s（升级驱动后未重启？）' % '，'.join('%s=%s' % x for x in vers.items()))
+    if smi['ok'] and nv['ok'] and len(nv['gpus']) != len(smi['gpus']):
+        F('工具链', WARN, 'nvidia-smi 看到 %d 张 GPU，NVML 直连看到 %d 张' % (len(smi['gpus']), len(nv['gpus'])))
+    if drv.get('preload_file'):
+        F('工具链', WARN, '/etc/ld.so.preload 非空：%s（可劫持 NVML 调用，请确认）' % '、'.join(drv['preload_file']))
+    if drv.get('preload_env'):
+        F('工具链', WARN, '当前环境设置了 LD_PRELOAD=%s（本脚本调用外部命令时已剔除）' % drv['preload_env'])
+    if smi['ok'] and not nv['ok']:
+        F('工具链', WARN, 'NVML 直连不可用（%s），无法与 nvidia-smi 输出交叉验证' % nv['error'])
+    if args.cuda and ctx.get('cuda') and not ctx['cuda']['ok']:
+        F('工具链', WARN if smi['ok'] else INFO, 'CUDA 属性查询失败：%s' % ctx['cuda']['error'])
+
+    # ---------------- 系统：GPU 数量、驱动绑定
+    hw = [p for p in pci.values() if is_nv_gpu(p)]
+    unbound = [p['bdf'] for p in hw if not p.get('driver')]
+    vfio = [p['bdf'] for p in hw if p.get('driver') in ('vfio-pci', 'pci-stub')]
+    if unbound:
+        F('系统', WARN, '%d 张 GPU 未绑定任何驱动：%s' % (len(unbound), ', '.join(short_bdf(b) for b in unbound)))
+    if vfio:
+        F('系统', INFO, '%d 张 GPU 绑定 vfio-pci（直通给虚拟机），仅能做硬件 ID 核验' % len(vfio))
+    on_nv = [p for p in hw if p.get('driver') == 'nvidia']
+    if smi['ok'] and on_nv and len(smi['gpus']) != len(on_nv):
+        F('工具链', WARN, 'PCI 上绑定 nvidia 驱动的 GPU 有 %d 张，nvidia-smi 只看到 %d 张%s'
+          % (len(on_nv), len(smi['gpus']), '（容器内运行时属正常）' if ctx['sys']['container'] else ''))
+    nvsw = [p for p in pci.values() if is_nvswitch(p)]
+    sxm = [g for g in gpus if g['db'] and g['db']['form'].startswith('SXM')]
+    exp_n = args.expect_gpus or (8 if (len(nvsw) >= 4 and sxm) else None)
+    if exp_n and len(hw or gpus) != exp_n:
+        F('系统', WARN, 'GPU 数量 %d 张，期望 %d 张（少卡/掉卡？）' % (len(hw or gpus), exp_n))
+    vb = set(g['smi']['vbios'] for g in gpus if g['smi'] and g['smi'].get('vbios'))
+    if len(vb) > 1:
+        F('系统', INFO, 'GPU 之间 VBIOS 版本不一致：%s' % '、'.join(sorted(vb)))
+    if ctx['sys']['virt'] not in (None, 'none'):
+        F('系统', INFO, '运行在虚拟化环境（%s）：PCI ID 由虚拟化层透传呈现，判定以驱动/NVML 交叉核验为准'
+          % ctx['sys']['virt'])
+
+    # ---------------- NVLink / NVSwitch / Fabric Manager
+    fm = ctx['fm']
+    if nvsw and sxm:
+        if fm.get('active') != 'active':
+            F('NVLink', WARN, 'NVSwitch 机器上 nvidia-fabricmanager 未运行（状态：%s），NVLink/CUDA 可能不可用'
+              % (fm.get('active') or ('未安装' if fm.get('load') == 'not-found' else '未知')))
+        bad = [g['idx'] for g in gpus if g['smi'] and g['smi'].get('fabric_state')
+               and (g['smi']['fabric_state'] != 'Completed' or (g['smi'].get('fabric_status') or 'Success') != 'Success')]
+        if bad:
+            F('NVLink', WARN, 'GPU %s 的 Fabric 状态未完成/失败' % compress_ids(bad))
+        if fm.get('version') and drv.get('kmod_version') and not fm['version'].startswith(drv['kmod_version']):
+            F('NVLink', WARN, 'Fabric Manager 版本 %s 与驱动 %s 不一致' % (fm['version'], drv['kmod_version']))
+        if len(sxm) == 8 and len(nvsw) not in (0, 4) and any(g['db']['family'] == 'H100' for g in sxm):
+            F('NVLink', WARN, 'HGX H100 8 卡应有 4 颗 NVSwitch，实际看到 %d 颗' % len(nvsw))
+    topo = ctx['topo']
+    if topo['ok'] and sxm:
+        labels = ['GPU%d' % g['idx'] for g in sxm if g['idx'] is not None]
+        want = sxm[0]['db'].get('links')
+        badp = []
+        for a in labels:
+            for b in labels:
+                if a < b:
+                    v = topo['rows'].get(a, {}).get(b)
+                    if v and (not v.startswith('NV') or (want and v != 'NV%d' % want)):
+                        badp.append('%s-%s=%s' % (a, b, v))
+        if badp:
+            F('NVLink', WARN, 'GPU 互联不是全 NV%s：%s%s' % (want or '#', '，'.join(badp[:6]),
+                                                       ' 等 %d 对' % len(badp) if len(badp) > 6 else ''))
+    elif sxm and not topo['ok'] and smi['ok']:
+        F('NVLink', WARN, '无法获取拓扑（nvidia-smi topo -m）：%s' % s(topo.get('error')))
+    errs = [(g['idx'], g['nvl']['errors']) for g in gpus if g.get('nvl') and g['nvl'].get('errors')]
+    if errs:
+        F('NVLink', INFO, 'NVLink 错误计数非零：%s（累计值，建议观察是否持续增长）'
+          % '，'.join('GPU%s=%d' % e for e in errs))
+    if ctx['xid'].get('sxid'):
+        F('NVLink', WARN, '内核日志中有 %d 条 NVSwitch SXid 错误' % ctx['xid']['sxid'])
+
+    # ---------------- IB / RDMA
+    hcas = [h for h in ctx['ib'] if not h.get('is_vf')]
+    if not hcas:
+        F('IB/RDMA', INFO, '未发现 IB/RDMA 网卡')
+    rates = Counter()
+    for h in hcas:
+        for pt in h['ports']:
+            name = '%s/%s' % (h['dev'], pt['port'])
+            if pt['state'] != 'ACTIVE':
+                why = ('物理链路已通但端口未激活，检查子网管理器 SM' if pt['phys'] == 'LinkUp'
+                       else '未连线或链路故障')
+                F('IB/RDMA', WARN, '%s 端口状态 %s / %s（%s）' % (name, s(pt['state']), s(pt['phys']), why))
+            elif pt['link_layer'] == 'InfiniBand':
+                rates[(pt['rate'] or '').split('(')[0].strip()] += 1
+            c = pt['counters']
+            if c.get('link_downed') or c.get('symbol_error') or c.get('port_rcv_errors'):
+                F('IB/RDMA', INFO, '%s 错误计数：link_downed=%s symbol_error=%s rcv_errors=%s（累计值）'
+                  % (name, c.get('link_downed', 0), c.get('symbol_error', 0), c.get('port_rcv_errors', 0)))
+        if h['cur_gen'] and h['max_gen'] and (h['cur_gen'] < h['max_gen'] or
+                                              (h['cur_w'] and h['max_w'] and h['cur_w'] != h['max_w'])):
+            F('PCIe', WARN, '%s（%s）PCIe 降级：当前 %s，能力 %s' % (h['dev'], h['model'], h['link'], h['link_max']))
+    if len(rates) > 1:
+        F('IB/RDMA', WARN, 'IB 端口速率不一致：%s' % '，'.join('%s x%d' % kv for kv in rates.most_common()))
+    if hcas and gpus and not ({'nvidia_peermem', 'nv_peer_mem'} & ctx['modules']):
+        F('IB/RDMA', INFO, '未加载 nvidia_peermem 模块（GPUDirect RDMA 需要；使用 DMA-BUF 方案可忽略）')
+
+    # ---------------- PCIe（GPU）
+    for g in gpus:
+        p = g['pci']
+        if not p:
+            continue
+        mw, cw = p.get('max_width'), p.get('cur_width')
+        if mw and mw.isdigit() and int(mw) < 16 and g['db'] and g['db']['arch'] == 'Hopper':
+            F('PCIe', WARN, 'GPU %s 的 PCIe 最大宽度仅 x%s' % (g['idx'], mw))
+        elif mw and cw and cw.isdigit() and mw.isdigit() and int(cw) < int(mw):
+            F('PCIe', WARN, 'GPU %s PCIe 降宽：当前 x%s，能力 x%s' % (g['idx'], cw, mw))
+        mg = pcie_gen(p.get('max_speed'))
+        if mg and g['db'] and g['db']['arch'] == 'Hopper' and mg < 5:
+            F('PCIe', WARN, 'GPU %s 的 PCIe 能力仅 Gen%d（Hopper 应为 Gen5）' % (g['idx'], mg))
+
+    # ---------------- GPU 健康（只读快照）
+    xid_by = {}
+    for bdf3, code in ctx['xid'].get('xid', []):
+        xid_by.setdefault(bdf3, []).append(code)
+    ctx['xid_by'] = xid_by
+    for g in gpus:
+        d, i = g['smi'], g['idx']
+        if not d:
+            continue
+        if d.get('ecc') == 'Disabled':
+            F('GPU健康', WARN, 'GPU %s 的 ECC 已关闭' % i)
+        if d.get('ecc_vol_unc'):
+            F('GPU健康', WARN, 'GPU %s 本次启动后出现 %d 个不可纠正 ECC 错误' % (i, d['ecc_vol_unc']))
+        if d.get('ecc_agg_unc'):
+            F('GPU健康', INFO, 'GPU %s 累计不可纠正 ECC 错误 %d 个（历史值）' % (i, d['ecc_agg_unc']))
+        if d.get('rr_failure') == 'Yes':
+            F('GPU健康', FAIL, 'GPU %s 行重映射失败（显存故障，建议报修）' % i)
+        if d.get('rr_pending') == 'Yes':
+            F('GPU健康', WARN, 'GPU %s 有待生效的行重映射（需在维护窗口复位 GPU）' % i)
+        if d.get('reset_required') == 'Yes' or d.get('drain_reset') == 'Yes':
+            F('GPU健康', WARN, 'GPU %s 驱动建议复位 GPU' % i)
+        if d.get('recovery') and d['recovery'] not in ('None', 'GPU_RECOVERY_ACTION_NONE'):
+            F('GPU健康', WARN, 'GPU %s 驱动建议恢复动作：%s' % (i, d['recovery']))
+        if d.get('temp') and d['temp'] >= 85:
+            F('GPU健康', WARN, 'GPU %s 核心温度 %d°C 偏高' % (i, d['temp']))
+        if d.get('mem_temp') and d['mem_temp'] >= 90:
+            F('GPU健康', WARN, 'GPU %s 显存温度 %d°C 偏高' % (i, d['mem_temp']))
+        badthr = [THROTTLE_CN.get(t, t) for t in d.get('throttle', []) if t in THROTTLE_BAD]
+        if badthr:
+            F('GPU健康', WARN, 'GPU %s 正在降频：%s' % (i, '、'.join(badthr)))
+        codes = xid_by.get(g['bdf'][:-2], [])
+        hard = sorted(set(c for c in codes if c not in XID_APP))
+        if hard:
+            F('GPU健康', WARN, 'GPU %s 内核日志有 Xid %s' % (i, '、'.join(
+                '%d(%s)' % (c, XID_DESC.get(c, '见 NVIDIA Xid 文档')) for c in hard)))
+        elif codes:
+            F('GPU健康', INFO, 'GPU %s 内核日志有应用类 Xid %s' % (i, '、'.join(str(c) for c in sorted(set(codes)))))
+        if g['cfg'] and g['cfg']['vendor'] == 0xffff:
+            F('GPU健康', FAIL, 'GPU %s PCI 配置空间无响应（掉卡？）' % i)
+    if not ctx['xid']['ok']:
+        F('GPU健康', INFO, '未检查 Xid：%s' % ctx['xid']['error'])
+
+
+# ============================================================================
+# 报告输出
+# ============================================================================
+
+def lv_cell(level, text):
+    return lvl_color(level, text)
+
+
+def render(ctx, args, elapsed):
+    rep = Report()
+    st = ctx['sys']
+    W = 108
+    rep.add(bold('=' * W))
+    rep.add(bold('  H100 GPU 服务器检测报告') + ' ' * (W - 40) + dim('h100_check v' + VERSION))
+    rep.add(bold('=' * W))
+    rep.add('  主机: %s    时间: %s    用户: %s    耗时: %.1fs'
+            % (st['hostname'], time.strftime('%Y-%m-%d %H:%M:%S %Z'), 'root' if G.is_root else '非 root', elapsed))
+    rep.add('  模式: 只读（不创建 CUDA 上下文 / 不占显存 / 不跑负载 / 不改任何配置），nice 19 + ionice idle'
+            + ('；已启用 --cuda 设备属性查询（无上下文）' if args.cuda else ''))
+    if not G.is_root:
+        rep.add('  ' + yellow('提示: 非 root 运行，内存条、整机序列号、网卡料号、内核日志等信息可能缺失'))
+
+    for fn, a in ((render_system, ()), (render_hw, ()), (render_gpu_list, ()), (render_authenticity, (args,)),
+                  (render_nvlink, ()), (render_ib, ()), (render_eth, ()), (render_health, ())):
+        try:
+            fn(rep, ctx, *a)
+        except Exception as e:
+            ERRORS.append('报告 %s：%s: %s' % (fn.__name__, type(e).__name__, e))
+            rep.note('（本节输出出错，已跳过：%s）' % e)
+    if ERRORS:
+        rep.section('附：脚本自身异常（不影响其它检测项，请反馈给脚本维护者）')
+        for e in ERRORS:
+            rep.add('  - ' + e)
+    render_conclusion(rep, ctx)
+    return rep
+
+
+def render_system(rep, ctx):
+    st, drv, smi, fm, ofed = ctx['sys'], ctx['drv'], ctx['smi'], ctx['fm'], ctx['ofed']
+    rep.section('一、系统概览')
+    need_root = '(需 root)' if not G.is_root else '-'
+    gsp = next((g['smi']['gsp'] for g in ctx['gpus'] if g['smi'] and g['smi'].get('gsp')), None)
+    if drv.get('kmod_version'):
+        kmod = '%s（%s）' % (drv['kmod_version'], '开源内核模块' if drv.get('kmod_open') else '闭源内核模块')
+    else:
+        kmod = red('未加载 NVIDIA 驱动') if any(is_nv_gpu(p) for p in ctx['pci'].values()) else '-'
+    if fm.get('load') == 'not-found' or (not fm.get('active') and not fm.get('version')):
+        fm_txt = '未安装'
+    else:
+        fm_txt = '%s%s%s' % (s(fm.get('active')), ' (%s)' % fm['sub'] if fm.get('sub') else '',
+                             '，版本 %s' % fm['version'] if fm.get('version') else '')
+    virt = st['virt'] if st['virt'] not in (None, 'none') else '物理机'
+    if st['container']:
+        virt += '（容器内）'
+    rep.kv([
+        ('主机名', st['hostname']),
+        ('服务器型号', ' '.join(x for x in (st['sys_vendor'], st['product_name']) if x) or '-'),
+        ('整机序列号', st['product_serial'] or need_root),
+        ('主板', ' '.join(x for x in (st['board_vendor'], st['board_name']) if x) or '-'),
+        ('BIOS', ' '.join(x for x in (st['bios_vendor'], st['bios_version'], st['bios_date']) if x) or '-'),
+        ('操作系统', s(st['os'])),
+        ('内核', '%s (%s)' % (s(st['kernel']), st['arch'])),
+        ('运行时长', s(st['uptime'])),
+        ('运行环境', virt),
+        ('NVIDIA 驱动', kmod),
+        ('CUDA 版本(驱动)', s(smi.get('cuda'))),
+        ('GSP 固件', s(gsp)),
+        ('Fabric Manager', fm_txt),
+        ('OFED / 网卡驱动', ofed.get('ofed') or ('内核自带 mlx5 驱动' if ctx['ib'] else '-')),
+    ])
+
+
+def render_hw(rep, ctx):
+    cpu, mem, disks = ctx['cpu'], ctx['mem'], ctx['disks']
+    rep.section('二、CPU / 内存 / 存储')
+    dimms = mem.get('dimms')
+    if dimms is not None:
+        pop = [d for d in dimms if _size_gb(d.get('Size')) not in (None, 0)]
+        dimm_txt = '%d / %d 槽位已插' % (len(pop), len(dimms))
+    else:
+        pop, dimm_txt = [], '(需 root 运行 dmidecode)'
+    rep.kv([
+        ('CPU 型号', s(cpu['model'])),
+        ('路数 / 核数 / 线程', '%s 路 / %s 核 / %s 线程' % (s(cpu['sockets']), s(cpu['cores']), s(cpu['threads']))),
+        ('NUMA 节点', s(cpu['numa'])),
+        ('内存总量', '%.0f GiB（操作系统可见）' % mem['total_gib'] if mem['total_gib'] else '-'),
+        ('内存条', dimm_txt),
+    ])
+    if pop:
+        grp = Counter()
+        for d in pop:
+            speed = d.get('Speed', '-')
+            cfgs = d.get('Configured Memory Speed') or d.get('Configured Clock Speed')
+            if cfgs and cfgs != speed:
+                speed = '%s (运行 %s)' % (speed, cfgs)
+            grp[(d.get('Size', '-'), d.get('Type', '-'), speed, d.get('Manufacturer', '-'),
+                 d.get('Part Number', '-').strip())] += 1
+        rep.table(['数量', '单条容量', '类型', '速率', '厂商', '型号'],
+                  [[str(n)] + list(k) for k, n in grp.most_common()], aligns='r')
+    if disks:
+        grp = Counter()
+        for d in disks:
+            try:
+                size = '%.2f TB' % (int(d.get('SIZE', '0')) / 1e12) if int(d.get('SIZE', '0')) >= 1e12 \
+                    else '%.0f GB' % (int(d.get('SIZE', '0')) / 1e9)
+            except ValueError:
+                size = d.get('SIZE', '-')
+            kind = 'HDD' if d.get('ROTA') == '1' else 'SSD'
+            grp[(d.get('MODEL', '').strip() or '-', size, (d.get('TRAN') or '-').upper(), kind)] += 1
+        names = {}
+        for d in disks:
+            names.setdefault((d.get('MODEL', '').strip() or '-'), []).append(d.get('NAME'))
+        rows = []
+        for (model, size, tran, kind), n in grp.most_common():
+            devs = names.get(model, [])
+            rows.append([str(n), model, size, tran, kind, clip(','.join(devs), 30)])
+        rep.table(['数量', '磁盘型号', '容量', '接口', '类型', '设备'], rows, aligns='r')
+
+
+def render_gpu_list(rep, ctx):
+    gpus = ctx['gpus']
+    rep.section('三、GPU 清单')
+    if not gpus:
+        rep.note('未发现 NVIDIA GPU')
+        return
+    rows = []
+    for g in gpus:
+        p, d = g['pci'] or {}, g['smi'] or {}
+        name = d.get('name') or (g['nvml'] or {}).get('name') or (g['db']['sku'] if g['db'] else '-')
+        mem = '%d MiB' % d['mem_total'] if d.get('mem_total') else '-'
+        pw = '%s/%sW' % (s(d.get('power_limit') and int(d['power_limit'])), s(d.get('power_max') and int(d['power_max']))) \
+            if d.get('power_max') else '-'
+        clk = '%s/%s' % (s(d.get('max_sm') and int(d['max_sm'])), s(d.get('max_mem') and int(d['max_mem']))) \
+            if d.get('max_sm') else '-'
+        rows.append([s(g['idx']), short_bdf(g['bdf']), clip(name, 26), mem, pw, clk,
+                     fmt_link(p.get('max_speed'), p.get('max_width')), s(p.get('numa') if p.get('numa', -1) >= 0 else None),
+                     s(d.get('vbios')), s(d.get('serial')), s(d.get('module_id')),
+                     s(p.get('driver'), red('无驱动') if p else '-')])
+    rep.table(['GPU', 'PCI', '型号(nvidia-smi)', '显存', '功耗墙 当前/最大', '最大频率 SM/显存', 'PCIe 能力',
+               'NUMA', 'VBIOS', '序列号', '模块', '驱动'], rows, aligns='r')
+    rows = []
+    for g in gpus:
+        d = g['smi'] or {}
+        rows.append([s(g['idx']), s(d.get('board_pn')), s(d.get('gpu_pn')), s(d.get('inforom')), s(d.get('uuid')),
+                     s(d.get('persistence')), s(d.get('mig')), s(d.get('ecc'))])
+    if any(g['smi'] for g in gpus):
+        rep.table(['GPU', '板卡料号', 'GPU 部件号', 'InfoROM', 'UUID', '持久模式', 'MIG', 'ECC'], rows, aligns='r')
+    rep.note('序列号/模块号可与 GPU 模组实物标签、供应商装箱单逐一核对。')
+
+
+def render_authenticity(rep, ctx, args):
+    gpus = ctx['gpus']
+    rep.section('四、H100 真伪核验')
+    rows = []
+    for g in gpus:
+        by = dict((c['key'], c) for c in g['checks'])
+
+        def cell(key, default='-'):
+            c = by.get(key)
+            if not c:
+                return default
+            v = c['value'] if c['value'] not in (None, '') else '-'
+            return lv_cell(c['level'], v) if c['level'] != INFO else v
+
+        sku = g['db']['sku'] if g['db'] else ('未知' if g['devid'] is not None else '-')
+        lvl, txt = g['verdict']
+        rows.append([s(g['idx']), short_bdf(g['bdf']), cell('hwid'), lv_cell(by['hwid']['level'], sku),
+                     cell('names'), cell('sm'), cell('bus'), cell('mem'), cell('power'), cell('clock'),
+                     cell('nvlink'), lv_cell(lvl, txt)])
+    if rows:
+        rep.table(['GPU', 'PCI', '硬件ID', '硬件识别型号', '名称一致', 'SM', '显存位宽', '显存', '功耗墙',
+                   '最大频率', 'NVLink', '结论'], rows, aligns='r')
+    # 异常明细
+    bad = [f for f in Findings.items if f[0] == '真伪' and f[1] >= WARN]
+    if bad:
+        rep.sub('异常明细：')
+        for cat, lvl, msg in bad:
+            rep.add('    %s %s' % (lvl_color(lvl, '[%s]' % LEVEL_TEXT[lvl]), msg))
+    # 工具链完整性
+    rep.sub('工具链完整性（防 nvidia-smi / NVML 被替换或劫持）：')
+    drv, smi, nv = ctx['drv'], ctx['smi'], ctx['nvml']
+    rows = []
+    files = ctx['smi_files']
+    if files:
+        f0 = files[0]
+        if G.test_mode:
+            elf = (INFO, '测试模式跳过')
+        elif f0.get('elf'):
+            elf = (OK, 'ELF 可执行文件')
+        else:
+            elf = (WARN, '不是 ELF（%s）' % ('脚本' if f0.get('script') else '未知格式'))
+        where = f0['path'] if f0['real'] == f0['path'] else '%s -> %s' % (f0['path'], f0['real'])
+        rows.append(['nvidia-smi 文件', lv_cell(elf[0], LEVEL_TEXT[elf[0]]),
+                     clip('%s，%s 字节，%s' % (elf[1], s(f0.get('size')), where), 100)])
+        lvl = OK if f0['pkg_ok'] else (WARN if f0['pkg_ok'] is False else INFO)
+        lvl = max([lvl] + [l for c, l, m in Findings.items if c == '工具链' and 'nvidia-smi' in m and '软件包' in m])
+        rows.append(['nvidia-smi 包校验', lv_cell(lvl, LEVEL_TEXT[lvl]), f0['pkg_msg']])
+        rows.append(['nvidia-smi SHA256', '-', s(f0.get('sha256'))])
+        if len(files) > 1:
+            rows.append(['多个 nvidia-smi', lv_cell(WARN, '警告'), '、'.join(f['path'] for f in files)])
+    else:
+        rows.append(['nvidia-smi 文件', lv_cell(WARN, '警告'), '未找到 nvidia-smi'])
+    vers = ctx.get('versions', {})
+    if vers:
+        lvl = max([OK] + [l for c, l, m in Findings.items if c == '工具链' and '版本不一致' in m])
+        rows.append(['驱动版本一致性', lv_cell(lvl, LEVEL_TEXT[lvl]), '，'.join('%s=%s' % kv for kv in vers.items())])
+    if nv['ok']:
+        rows.append(['NVML 直连交叉验证', lv_cell(OK, '通过'),
+                     clip('已绕过 nvidia-smi 直接调用 %s' % s(nv.get('lib')), 100)])
+    else:
+        rows.append(['NVML 直连交叉验证', lv_cell(WARN if smi['ok'] else INFO, '不可用'), s(nv.get('error'))])
+    pre = drv.get('preload_file') or []
+    lvl = WARN if (pre or drv.get('preload_env')) else OK
+    rows.append(['LD_PRELOAD 劫持', lv_cell(lvl, LEVEL_TEXT[lvl]),
+                 '、'.join(pre + ([drv['preload_env']] if drv.get('preload_env') else [])) or '/etc/ld.so.preload 为空，无 LD_PRELOAD'])
+    cnt = [('PCI', len([p for p in ctx['pci'].values() if is_nv_gpu(p)])), ('驱动/proc', len(ctx['proc'])),
+           ('nvidia-smi', len(smi['gpus']) if smi['ok'] else None), ('NVML', len(nv['gpus']) if nv['ok'] else None)]
+    cnt = [(k, v) for k, v in cnt if v is not None]
+    lvl = OK if len(set(v for _, v in cnt)) <= 1 else WARN
+    rows.append(['GPU 数量一致性', lv_cell(lvl, LEVEL_TEXT[lvl]), '，'.join('%s=%d' % kv for kv in cnt)])
+    if drv.get('kmod_line'):
+        rows.append(['内核模块', '-', clip(drv['kmod_line'], 90)])
+        rows.append(['模块 srcversion', '-', '%s（taint=%s，可与同版本正常机器比对）'
+                     % (s(drv.get('srcversion')), s(drv.get('taint')))])
+    rep.table(['检查项', '结果', '说明'], rows)
+    rep.note('判定方法（全部只读，多层交叉验证）：\n'
+             '  1) 硬件层：PCI 配置空间里的设备 ID 由 GPU 芯片熔丝决定，改名/改标签/改 nvidia-smi 都改不了；\n'
+             '     H100 SXM5=0x2330、H100 PCIe=0x2331、H100 NVL=0x2321，而 H20=0x2329、H800=0x2324；\n'
+             '  2) 驱动层：/proc 驱动型号、NVML 直连（绕过 nvidia-smi 程序）、nvidia-smi 三者都必须与硬件 ID 一致；\n'
+             '  3) 规格指纹：SM 数、显存位宽、显存容量、功耗墙、最大频率、NVLink 链路数与该型号标准值比对；\n'
+             '  4) 工具链：nvidia-smi 是否原厂 ELF、包管理器校验、驱动各组件版本一致性、LD_PRELOAD 劫持。\n'
+             '  局限：无法防御内核级伪造（修改内核 PCI 层）；如需算力实测，请在维护窗口对空闲 GPU 单独做压测。')
+
+
+def render_nvlink(rep, ctx):
+    gpus, topo, fm, pci = ctx['gpus'], ctx['topo'], ctx['fm'], ctx['pci']
+    rep.section('五、NVLink 拓扑')
+    if topo['ok']:
+        labels = [l for l in topo['order'] if l.startswith('GPU')]
+        rows = []
+        for a in labels:
+            row = topo['rows'][a]
+            cells = [a]
+            for b in labels:
+                v = row.get(b, '-')
+                cells.append(dim(v) if v == 'X' else (green(v) if v.startswith('NV') else yellow(v)))
+            cells += [row.get('CPU Affinity', '-'), row.get('NUMA Affinity', '-') or '-']
+            rows.append(cells)
+        rep.sub('GPU 互联矩阵（nvidia-smi topo -m）：')
+        rep.table([''] + labels + ['CPU 亲和', 'NUMA'], rows, aligns='l' + 'c' * len(labels))
+        rep.note('NV# = 经 # 条 NVLink 互联（HGX 机型经 NVSwitch）；PIX/PXB = 经 PCIe 交换芯片；'
+                 'PHB = 经 CPU 根复合体；NODE = 同 NUMA 跨根复合体；SYS = 跨 NUMA')
+    else:
+        rep.note('无法获取拓扑矩阵：%s' % s(topo.get('error'), 'nvidia-smi 不可用'))
+    nvsw = sorted(p['bdf'] for p in pci.values() if is_nvswitch(p))
+    sw_idx = dict((b, i) for i, b in enumerate(nvsw))
+    gpu_idx = dict((g['bdf'], g['idx']) for g in gpus)
+    rows = []
+    for g in gpus:
+        nl = g.get('nvl')
+        if not nl:
+            continue
+        speeds = Counter(nl['speeds'])
+        each = '%.3f GB/s' % speeds.most_common(1)[0][0] if speeds else '-'
+        total = '%.1f GB/s' % sum(nl['speeds']) if nl['speeds'] else '-'
+        dist = Counter()
+        for lk in ((g['nvml'] or {}).get('nvlinks') or {}).values():
+            r = lk.get('remote')
+            if lk.get('active') and r:
+                dist['SW%d' % sw_idx[r] if r in sw_idx else ('GPU%s' % gpu_idx[r] if r in gpu_idx else short_bdf(r))] += 1
+        dist_txt = ' '.join('%s:%d' % kv for kv in sorted(dist.items())) or '-'
+        lvl = OK if not nl['inactive'] else WARN
+        d = g['smi'] or {}
+        fab = '%s/%s' % (d['fabric_state'], s(d.get('fabric_status'))) if d.get('fabric_state') else '-'
+        rows.append(['GPU%s' % g['idx'], lv_cell(lvl, '%d/%d' % (nl['active'], nl['total'])), each, total,
+                     lv_cell(WARN, ','.join(str(x) for x in nl['inactive'])) if nl['inactive'] else '-',
+                     dist_txt, s(nl.get('errors')), fab])
+    if rows:
+        rep.sub('NVLink 链路状态：')
+        rep.table(['GPU', '激活/总数', '单链速率', '合计(单向)', '未激活链路', '对端分布(NVML)', '错误计数', 'Fabric 状态'],
+                  rows)
+    elif any(g['db'] and g['db'].get('links') for g in gpus):
+        rep.note('未读取到 NVLink 链路信息')
+    else:
+        rep.note('本机 GPU 无 NVLink（或未桥接）')
+    if nvsw:
+        devs = Counter(NVSWITCH_DB.get(pci[b]['device'], '0x%04x' % pci[b]['device']) for b in nvsw)
+        rep.add('  NVSwitch: %d 颗（%s）@ %s' % (len(nvsw), '，'.join('%s x%d' % kv for kv in devs.items()),
+                                              ', '.join('SW%d=%s' % (i, short_bdf(b)) for i, b in enumerate(nvsw))))
+    if nvsw or fm.get('active') == 'active':
+        rep.add('  Fabric Manager: %s%s' % (s(fm.get('active'), '未安装'), '，版本 %s' % fm['version'] if fm.get('version') else ''))
+
+
+def _nic_affinity(topo, gpus):
+    """返回 ({gpu_idx: [(nic, rel)]}, {nic: [gpu_idx]})：只取最近的关系（PIX/PXB 优先）"""
+    g2n, n2g = {}, {}
+    if not topo['ok']:
+        return g2n, n2g
+    nic_cols = [c for c in topo['cols'] if not c.startswith('GPU') and c not in
+                ('CPU Affinity', 'NUMA Affinity', 'GPU NUMA ID')]
+    for g in gpus:
+        row = topo['rows'].get('GPU%s' % g['idx'])
+        if not row:
+            continue
+        best, rank = [], 99
+        for c in nic_cols:
+            v = row.get(c)
+            r = TOPO_RANK.get(v, 99)
+            if r < rank:
+                best, rank = [], r
+            if r == rank and r < 99:
+                best.append((topo['nic_map'].get(c, c), v))
+        if best and rank <= 2:
+            g2n[g['idx']] = best
+            for nic, _ in best:
+                n2g.setdefault(nic, []).append(g['idx'])
+    return g2n, n2g
+
+
+def render_ib(rep, ctx):
+    hcas = [h for h in ctx['ib'] if not h.get('is_vf')]
+    vfs = len(ctx['ib']) - len(hcas)
+    rep.section('六、IB / RDMA 网卡')
+    if not hcas:
+        rep.note('未发现 IB/RDMA 设备（/sys/class/infiniband 为空）')
+        return
+    g2n, n2g = _nic_affinity(ctx['topo'], ctx['gpus'])
+    rows = []
+    for h in hcas:
+        v = h.get('vpd') or {}
+        degraded = h['cur_gen'] and h['max_gen'] and (h['cur_gen'] < h['max_gen'] or h['cur_w'] != h['max_w'])
+        link = '%s / %s' % (h['link'], h['link_max'])
+        rows.append([h['dev'], h['model'], s(v.get('PN'), '(需 root)' if not G.is_root else '-'), s(v.get('SN')),
+                     short_bdf(h['bdf']), s(h['numa'] if (h['numa'] is not None and h['numa'] >= 0) else None),
+                     yellow(link) if degraded else link, s(h['fw']), s(h['psid'])])
+    rep.sub('网卡硬件：')
+    rep.table(['设备', '型号', '料号(PN)', '序列号', 'PCI', 'NUMA', 'PCIe 当前/能力', '固件', 'PSID'], rows)
+    descs = sorted(set(h['vpd']['ID'] for h in hcas if h.get('vpd') and h['vpd'].get('ID')))
+    for dsc in descs:
+        rep.note('型号描述: ' + dsc)
+    rows = []
+    for h in hcas:
+        for pt in h['ports']:
+            ok = pt['state'] == 'ACTIVE'
+            c = pt['counters']
+            err = '%s/%s/%s' % (c.get('link_downed', '-'), c.get('symbol_error', '-'), c.get('port_rcv_errors', '-')) if c else '-'
+            rate = re.sub(r'\s+', ' ', (pt['rate'] or '-').replace('Gb/sec', 'Gb/s'))
+            gl = n2g.get(h['dev'])
+            rows.append(['%s:%s' % (h['dev'], pt['port']), s(pt['link_layer']),
+                         lv_cell(OK if ok else WARN, s(pt['state'])), s(pt['phys']), rate,
+                         s(pt['lid']) if pt['link_layer'] == 'InfiniBand' else '-',
+                         ','.join(h['netdevs']) or '-', ('GPU' + compress_ids(gl)) if gl else '-', err])
+    rep.sub('端口状态：')
+    rep.table(['设备:端口', '链路层', '状态', '物理状态', '速率', 'LID', '网口', '亲和 GPU', 'down/symbol/rcv'], rows)
+    if g2n:
+        rows = [['GPU%s' % i, ', '.join('%s(%s)' % x for x in g2n[i])] for i in sorted(g2n)]
+        rep.sub('GPU 与网卡亲和（GPUDirect RDMA 就近原则）：')
+        rep.table(['GPU', '最近的 RDMA 网卡（PIX=同一 PCIe 交换，PXB=多级 PCIe 交换）'], rows)
+    mods = ctx['modules']
+    stack = [m for m in ('mlx5_core', 'mlx5_ib', 'ib_core', 'ib_uverbs', 'nvidia_peermem', 'nv_peer_mem', 'gdrdrv',
+                         'nvidia_fs') if m in mods]
+    rep.add('  RDMA 软件栈: %s；已加载模块: %s%s' % (
+        ctx['ofed'].get('ofed') or '内核自带驱动', ', '.join(stack) or '-', '；另有 %d 个 VF 未列出' % vfs if vfs else ''))
+
+
+def render_eth(rep, ctx):
+    nics, vfs = ctx['eth']
+    rep.section('七、其它网卡')
+    if not nics:
+        rep.note('无')
+        return
+    names = ctx.get('lspci') or {}
+    rows = []
+    for n in nics:
+        model = MLX_DB.get(n['device']) if n['vendor'] == 0x15b3 else None
+        model = model or names.get(n['bdf']) or ('%04x:%04x' % (n['vendor'], n['device']) if n['vendor'] else '-')
+        sp = ('%dG' % (n['speed'] // 1000) if n['speed'] >= 1000 else '%dM' % n['speed']) if n['speed'] else '-'
+        typ = 'IPoIB' if n['type'] == '32' else 'Ethernet'
+        rows.append([n['ifname'], clip(model, 44), typ, s(n['driver']), short_bdf(n['bdf']),
+                     s(n['numa'] if (n['numa'] is not None and n['numa'] >= 0) else None), sp,
+                     lv_cell(OK if n['state'] == 'up' else INFO, s(n['state'])), s(n['mtu'])])
+    rep.table(['网口', '型号', '类型', '驱动', 'PCI', 'NUMA', '速率', '状态', 'MTU'], rows)
+    if vfs:
+        rep.note('另有 %d 个 SR-IOV VF 网口未列出' % vfs)
+
+
+def render_health(rep, ctx):
+    gpus = ctx['gpus']
+    rep.section('八、GPU 运行状态（只读快照）')
+    if not any(g['smi'] for g in gpus):
+        rep.note('nvidia-smi 不可用，无运行状态数据')
+        return
+    rows = []
+    for g in gpus:
+        d, p = g['smi'], g['pci'] or {}
+        if not d:
+            continue
+        temp = '%s/%s' % (s(d.get('temp') and int(d['temp'])), s(d.get('mem_temp') and int(d['mem_temp'])))
+        pw = '%s/%sW' % (s(d.get('power_draw') and int(d['power_draw'])), s(d.get('power_limit') and int(d['power_limit'])))
+        mem = '%s/%s' % (s(d.get('mem_used') and int(d['mem_used']), '0'), s(d.get('mem_total') and int(d['mem_total'])))
+        unc = '%s/%s' % (s(d.get('ecc_vol_unc')), s(d.get('ecc_agg_unc')))
+        unc = lv_cell(WARN, unc) if d.get('ecc_vol_unc') else unc
+        rr = '待处理' if d.get('rr_pending') == 'Yes' else ('失败' if d.get('rr_failure') == 'Yes' else '正常')
+        rr = lv_cell(OK if rr == '正常' else (FAIL if rr == '失败' else WARN), rr) if d.get('rr_pending') else '-'
+        thr = [THROTTLE_CN.get(t, t) for t in d.get('throttle', [])]
+        thr_txt = lv_cell(WARN, ','.join(thr)) if any(t in THROTTLE_BAD for t in d.get('throttle', [])) else (','.join(thr) or '-')
+        codes = (ctx.get('xid_by') or {}).get(g['bdf'][:-2], [])
+        xid = ','.join('%d' % c for c in sorted(set(codes))) if codes else ('0' if ctx['xid']['ok'] else '-')
+        rows.append(['GPU%s' % g['idx'], temp, pw, '%s%%' % s(d.get('util') and int(d['util']), '0'), mem,
+                     str(d.get('procs', 0)), fmt_link(p.get('cur_speed'), p.get('cur_width')), s(d.get('ecc')), unc,
+                     rr, thr_txt, lv_cell(WARN, xid) if codes else xid])
+    rep.table(['GPU', '温度 核心/显存', '功耗 当前/墙', '利用率', '显存 已用/总(MiB)', '进程', 'PCIe 当前', 'ECC',
+               '不可纠正ECC 本次/累计', '行重映射', '降频原因', 'Xid'], rows, aligns='l')
+    rep.note('空闲时 GPU 的 PCIe 会自动降速节能（如 Gen1），属正常现象；Xid 来源：%s' % s(ctx['xid'].get('src')))
+
+
+def _skus(gpus):
+    c = Counter(g['db']['sku'] for g in gpus if g['db'])
+    return '、'.join(k if len(c) == 1 else '%s x%d' % (k, n) for k, n in c.most_common()) or '-'
+
+
+def auth_level(gpus):
+    """真伪总判定：任一卡不通过/工具链有篡改证据 = FAIL；有卡无法确认 = WARN；否则 OK"""
+    lvl = max([g.get('auth', g['verdict'][0]) for g in gpus] or [FAIL])
+    return FAIL if Findings.worst(['工具链']) == FAIL else lvl
+
+
+def render_conclusion(rep, ctx):
+    rep.section('九、检测结论')
+    rows = []
+    gpus = ctx['gpus']
+    for cat in CATEGORIES:
+        items = [(lvl, msg) for c, lvl, msg in Findings.items if c == cat]
+        lvl = max([l for l, _ in items] or [OK])
+        if cat == '真伪':
+            vt = ctx.get('verdicts') or Counter()
+            if lvl == OK and gpus:
+                msg = '%d/%d 张 GPU 确认为 %s（硬件 ID、驱动、NVML、规格指纹一致）' % (len(gpus), len(gpus), _skus(gpus))
+            else:
+                msg = '；'.join('%s（%d 张）' % kv for kv in vt.most_common()) or '无 GPU'
+        else:
+            shown = [m for l, m in sorted(items, key=lambda x: -x[0]) if l >= WARN] or [m for l, m in items]
+            msg = clip(shown[0], 96) if shown else '未发现问题'
+            if len(shown) > 1:
+                msg += '（另 %d 项）' % (len(shown) - 1)
+        rows.append([cat, lv_cell(lvl, LEVEL_TEXT[lvl]), msg])
+    rep.table(['类别', '结果', '摘要'], rows)
+    auth = auth_level(gpus)
+    others = [(c, l, m) for c, l, m in Findings.items if l >= WARN and (c != '真伪' or auth == OK)]
+    if others:
+        rep.sub('需关注：')
+        for c, l, m in sorted(others, key=lambda x: (-x[1], CATEGORIES.index(x[0]))):
+            rep.add('    %s [%s] %s' % (lvl_color(l, LEVEL_TEXT[l]), c, m))
+    infos = [(c, m) for c, l, m in Findings.items if l == INFO]
+    if infos:
+        rep.sub('提示信息：')
+        for c, m in infos:
+            rep.add('    %s [%s] %s' % (cyan('提示'), c, m))
+    allw = Findings.worst()
+    rep.add('')
+    if auth == FAIL:
+        bad = [g for g in gpus if g['verdict'][0] == FAIL]
+        if not gpus:
+            rep.add(red('  总体结论：[不通过] 未发现任何 NVIDIA GPU。'))
+        elif bad:
+            rep.add(red('  总体结论：[不通过] %d 张 GPU 真伪核验不通过（%s），详见第四节。'
+                        % (len(bad), '；'.join('%s %d 张' % kv for kv in Counter(g['verdict'][1] for g in bad).items()))))
+        else:
+            rep.add(red('  总体结论：[不通过] 工具链疑似被篡改，GPU 信息不可信，详见第四节。'))
+    elif auth == WARN:
+        rep.add(yellow('  总体结论：[待确认] 真伪核验存在无法确认的项目，详见第四节。'))
+    elif allw >= WARN:
+        rep.add(yellow('  总体结论：[通过，有告警] %d 张 GPU 确认为真 %s；另有 %d 项健康/配置告警，见上方“需关注”。'
+                       % (len(gpus), _skus(gpus), len(others))))
+    else:
+        rep.add(green('  总体结论：[通过] %d 张 GPU 确认为真 %s，未发现健康或配置问题。' % (len(gpus), _skus(gpus))))
+    rep.add('')
+
+
+# ============================================================================
+# 主流程
+# ============================================================================
+
+def setup_stdio():
+    for name in ('stdout', 'stderr'):
+        st = getattr(sys, name)
+        enc = (getattr(st, 'encoding', '') or '').lower().replace('-', '')
+        if enc != 'utf8' and hasattr(st, 'buffer'):
+            try:
+                setattr(sys, name, io.TextIOWrapper(st.buffer, encoding='utf-8', errors='replace', line_buffering=True))
+            except Exception:
+                pass
+
+
+def lower_priority():
+    try:
+        os.nice(19)
+    except Exception:
+        pass
+    ion = which('ionice')
+    if ion and not G.test_mode:
+        run([ion, '-c', '3', '-p', str(os.getpid())], 5)
+
+
+class Progress(object):
+    def __init__(self):
+        self.tty = sys.stderr.isatty()
+
+    def __call__(self, msg):
+        if self.tty:
+            sys.stderr.write('\r\x1b[K[h100_check] 正在采集：%s ...' % msg)
+            sys.stderr.flush()
+
+    def done(self):
+        if self.tty:
+            sys.stderr.write('\r\x1b[K')
+            sys.stderr.flush()
+
+
+ERRORS = []
+
+
+def safe(label, fn, default, *a):
+    try:
+        return fn(*a)
+    except Exception as e:      # 真实环境格式千差万别：单项失败只记录，不影响其它检测
+        ERRORS.append('%s：%s: %s' % (label, type(e).__name__, e))
+        return default
+
+
+def collect_all(args):
+    step = Progress()
+    ctx = {}
+    step('系统 / CPU / 内存 / 存储')
+    ctx['sys'] = safe('系统信息', collect_system, {'hostname': socket.gethostname(), 'virt': None, 'container': False})
+    ctx['cpu'] = safe('CPU', collect_cpu, dict(model=None, sockets=None, cores=None, threads=None, numa=None))
+    ctx['mem'] = safe('内存', collect_memory, {'total_gib': None, 'dimms': None})
+    ctx['disks'] = safe('存储', collect_storage, None)
+    step('PCI 设备')
+    ctx['pci'] = safe('PCI 扫描', scan_pci, {})
+    ctx['modules'] = safe('内核模块', loaded_modules, set())
+    step('NVIDIA 驱动与工具链完整性')
+    ctx['drv'] = safe('驱动信息', collect_driver, {'proc_ok': False})
+    smi_paths = locate_all('nvidia-smi', ['/usr/bin', '/usr/local/bin', '/usr/local/nvidia/bin', '/opt/nvidia/bin'])
+    ctx['smi_files'] = safe('nvidia-smi 完整性', lambda: [file_check(smi_paths[0])] + [dict(path=p) for p in smi_paths[1:]]
+                            if smi_paths else [], [])
+    smi = smi_paths[0] if smi_paths else None
+    step('nvidia-smi -q（只读查询）')
+    ctx['smi'] = safe('nvidia-smi', collect_smi, {'ok': False, 'error': '解析出错', 'gpus': []}, smi)
+    ctx['proc'] = safe('/proc 驱动信息', collect_proc_gpus, {})
+    step('NVML 直连查询')
+    ctx['nvml'] = safe('NVML', collect_nvml, {'ok': False, 'error': '调用出错', 'gpus': {}}, args.nvml_lib)
+    if args.cuda:
+        step('CUDA 设备属性（无上下文）')
+        ctx['cuda'] = safe('CUDA', collect_cuda, {'ok': False, 'error': '调用出错', 'gpus': {}}, args.cuda_lib)
+    step('NVLink 拓扑')
+    ctx['topo'] = safe('拓扑', collect_topo, {'ok': False, 'cols': [], 'rows': {}, 'order': [], 'nic_map': {}, 'error': '解析出错'}, smi)
+    ctx['nvlink'] = safe('NVLink', collect_nvlink, {'status': {}, 'errors': {}, 'error': '解析出错'}, smi)
+    ctx['fm'] = safe('Fabric Manager', collect_fm, {})
+    step('IB / 网卡')
+    ctx['ib'] = safe('IB 网卡', collect_ib, [], ctx['pci'])
+    rdma_netdevs = set(n for h in ctx['ib'] for n in h['netdevs'])
+    ctx['eth'] = safe('网卡', collect_eth, ([], 0), ctx['pci'], rdma_netdevs)
+    if any(n['vendor'] != 0x15b3 for n in ctx['eth'][0]):
+        ctx['lspci'] = safe('lspci', lspci_names, {})
+    ctx['ofed'] = safe('OFED', collect_ofed, {})
+    step('内核日志 Xid')
+    ctx['xid'] = safe('Xid', collect_xid, {'ok': False, 'xid': [], 'sxid': 0, 'error': '解析出错'})
+    ctx['gpus'] = safe('GPU 汇总', assemble_gpus, [], ctx)
+    step.done()
+    return ctx
+
+
+def parse_args():
+    ap = argparse.ArgumentParser(
+        prog='h100_check.py',
+        description='H100 GPU 服务器只读检测：硬件清单、IB 网卡、NVLink 拓扑、H100 真伪核验（不影响线上业务）。',
+        epilog='退出码：0=通过 1=有告警 2=真伪不通过（非 H100 或疑似篡改） 3=运行错误')
+    ap.add_argument('-o', '--output', metavar='FILE', help='同时把报告（无颜色）保存到文件')
+    ap.add_argument('--expect', default='h100', choices=['h100', 'h100-sxm', 'h100-pcie', 'h100-nvl', 'any'],
+                    help='期望的 GPU 型号（默认 h100，任意 H100 形态均可；h100-sxm 则 PCIe 版也判不通过；any 只做一致性检查）')
+    ap.add_argument('--expect-gpus', type=int, metavar='N', help='期望的 GPU 数量（HGX 8 卡机型默认按 8 检查）')
+    ap.add_argument('--cuda', action='store_true',
+                    help='额外通过 CUDA 驱动 API 读取 SM 数/L2 等属性（只调用 cuInit 与属性查询，不创建上下文、不占显存）')
+    ap.add_argument('--no-color', action='store_true', help='禁用颜色')
+    ap.add_argument('-V', '--version', action='version', version='h100_check ' + VERSION)
+    # 以下为离线测试用的隐藏参数
+    ap.add_argument('--sysroot', help=argparse.SUPPRESS)
+    ap.add_argument('--nvml-lib', default='libnvidia-ml.so.1', help=argparse.SUPPRESS)
+    ap.add_argument('--cuda-lib', default='libcuda.so.1', help=argparse.SUPPRESS)
+    ap.add_argument('--assume-root', action='store_true', help=argparse.SUPPRESS)
+    return ap.parse_args()
+
+
+def main():
+    setup_stdio()
+    args = parse_args()
+    G.sysroot = (args.sysroot or '').rstrip('/')
+    G.test_mode = bool(G.sysroot)
+    if not G.test_mode and not sys.platform.startswith('linux'):
+        sys.stderr.write('h100_check: 只支持 Linux\n')
+        return 3
+    G.is_root = args.assume_root or os.geteuid() == 0
+    G.color = (sys.stdout.isatty() and not args.no_color and os.environ.get('TERM') != 'dumb'
+               and 'NO_COLOR' not in os.environ)
+    lower_priority()
+    t0 = time.time()
+    ctx = collect_all(args)
+    try:
+        evaluate(ctx, args)
+    except Exception as e:
+        ERRORS.append('综合判定：%s: %s' % (type(e).__name__, e))
+        Findings.add('系统', WARN, '综合判定过程出错，结论可能不完整：%s' % e)
+    rep = render(ctx, args, time.time() - t0)
+    text = '\n'.join(rep.lines)
+    print(text)
+    if args.output:
+        try:
+            with io.open(args.output, 'w', encoding='utf-8') as f:
+                f.write(ANSI_RE.sub('', text) + '\n')
+            sys.stderr.write('报告已保存到 %s\n' % args.output)
+        except Exception as e:
+            sys.stderr.write('保存报告失败：%s\n' % e)
+    if auth_level(ctx['gpus']) == FAIL:
+        return 2
+    if Findings.worst() >= WARN:
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+# ---- end of h100_check.py ----

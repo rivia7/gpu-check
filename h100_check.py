@@ -37,7 +37,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from collections import Counter
 
-VERSION = '1.2.0'
+VERSION = '1.2.1'
 DEFAULT_EXPECT = 'h100-sxm'   # 默认核验 H100 SXM5，即国内常说的“NVLink 版”（HGX 机型）
 
 OK, INFO, WARN, FAIL = 0, 1, 2, 3
@@ -93,6 +93,7 @@ _CN = '面向中国市场的特供版'
 _4090D = '面向中国市场的特供版（114 个 SM，RTX 4090 为 128 个，算力低约 5%~10%）'
 _5090D = '面向中国市场的特供版（AI 算力受驱动/固件限制）'
 _5090DV2 = '面向中国市场的特供版（24GB 显存、384-bit 位宽；RTX 5090 为 32GB、512-bit）'
+_6000D = '面向中国市场的特供版（156 个 SM、448-bit、84GB 显存；RTX PRO 6000 为 188 个 SM、512-bit、96GB）'
 
 GPU_DB = {
     # ---- H100 ----
@@ -125,6 +126,7 @@ GPU_DB = {
     0x2302: _sku('GH100 未命名ID', 'GH100?', '?', None, note=_ES),
     0x2343: _sku('GH100 未命名ID', 'GH100?', '?', None, note=_ES),
     0x2345: _sku('GH100-88K-A1', 'GH100?', '?', None, note=_ES),
+    0x237e: _sku('GH100 未命名ID', 'GH100?', '?', None, note=_ES),
 }
 
 
@@ -141,6 +143,7 @@ _add((0x2920, 0x29bc), 'B100', 'B100', 'GB100', 'dc', None, form='SXM6')
 _add(0x2941, 'GB200', 'GB200', 'GB100', 'dc', None, form='Superchip')
 _add(0x3182, 'B300 SXM6', 'B300', 'GB110', 'dc', None, form='SXM6')
 _add((0x31c2, 0x31c3), 'GB300', 'GB300', 'GB110', 'dc', None, form='Superchip')
+_add(0x31a1, 'GB300 Max-Q', 'GB300', 'GB110', 'dc', None, form='?')
 # ---- Ampere 数据中心 ----
 _add(0x20b0, 'A100 SXM4 40GB', 'A100', 'GA100', 'dc', 40, form='SXM4', sms=108, bus=5120, maxw=400, links=12)
 _add(0x20b2, 'A100 SXM4 80GB', 'A100', 'GA100', 'dc', 80, form='SXM4', sms=108, bus=5120, maxw=(400, 500), links=12)
@@ -179,9 +182,19 @@ _add(0x1b38, 'P40 24GB', 'P40', 'GP102', 'dc', 24, sms=30, bus=384, maxw=250)
 _add(0x1bb3, 'P4 8GB', 'P4', 'GP104', 'dc', 8, sms=20, bus=256, maxw=75)
 # ---- 专业卡（RTX / Quadro）----
 _add(0x2bb1, 'RTX PRO 6000 Blackwell', 'RTX PRO 6000', 'GB202', 'ws', 96, sms=188, bus=512)
+_add(0x2bb4, 'RTX PRO 6000 Blackwell Max-Q', 'RTX PRO 6000', 'GB202', 'ws', 96, sms=188, bus=512)
 _add(0x2bb5, 'RTX PRO 6000 Blackwell Server', 'RTX PRO 6000', 'GB202', 'dc', 96, sms=188, bus=512)
-_add(0x2bb2, 'RTX PRO 6000D Blackwell', 'RTX PRO 6000D', 'GB202', 'ws', None, note=_CN)
+# RTX PRO 6000D：NVIDIA 驱动里的名称是“NVIDIA RTX 6000D”（没有 PRO）。0x2bb9 是实际出货的服务器版，
+# 规格取自 8 张实卡；0x2bb2、0x2bbc 只见于 pci.ids，驱动未收录，规格不明
+_add(0x2bb9, 'RTX PRO 6000D Blackwell Server', 'RTX PRO 6000D', 'GB202', 'dc', 84, sms=156, bus=448, note=_6000D)
+_add(0x2bb2, 'RTX PRO 6000D Blackwell', 'RTX PRO 6000D', 'GB202', 'ws', None, note=_6000D)
+_add(0x2bbc, 'RTX PRO 6000D Blackwell Max-Q', 'RTX PRO 6000D', 'GB202', 'ws', None, note=_6000D)
+_add(0x2bbd, 'RTX PRO 5500 Blackwell', 'RTX PRO 5500', 'GB202', 'ws', None)
 _add(0x2bb3, 'RTX PRO 5000 Blackwell', 'RTX PRO 5000', 'GB202', 'ws', (48, 72))
+_add(0x2c31, 'RTX PRO 4500 Blackwell', 'RTX PRO 4500', 'GB203', 'ws', 32)
+_add(0x2c3a, 'RTX PRO 4500 Blackwell Server', 'RTX PRO 4500', 'GB203', 'dc', 32)
+_add((0x2c34, 0x2c33), 'RTX PRO 4000 Blackwell', 'RTX PRO 4000', 'GB203', 'ws', 24)
+_add(0x2d30, 'RTX PRO 2000 Blackwell', 'RTX PRO 2000', 'GB206', 'ws', 16)
 _add(0x26b1, 'RTX 6000 Ada 48GB', 'RTX 6000 Ada', 'AD102', 'ws', 48, sms=142, bus=384, maxw=300)
 _add(0x26b3, 'RTX 5880 Ada 48GB', 'RTX 5880 Ada', 'AD102', 'ws', 48, sms=110, bus=384)
 _add(0x26b2, 'RTX 5000 Ada 32GB', 'RTX 5000 Ada', 'AD102', 'ws', 32, sms=100, bus=256, maxw=250)
@@ -207,9 +220,11 @@ _add(0x2b87, 'RTX 5090 D', 'RTX 5090 D', 'GB202', 'gf', 32, sms=170, bus=512, no
 _add(0x2b8c, 'RTX 5090 D V2', 'RTX 5090 D V2', 'GB202', 'gf', 24, sms=170, bus=384, note=_5090DV2)
 _add(0x2c02, 'RTX 5080', 'RTX 5080', 'GB203', 'gf', 16, sms=84, bus=256)
 _add(0x2c05, 'RTX 5070 Ti', 'RTX 5070 Ti', 'GB203', 'gf', 16, sms=70, bus=256)
+_add(0x2f02, 'RTX 5070 SUPER', 'RTX 5070 SUPER', 'GB205', 'gf', None)
 _add((0x2f04, 0x2c09), 'RTX 5070', 'RTX 5070', 'GB205', 'gf', 12, sms=48, bus=192)
 _add(0x2d04, 'RTX 5060 Ti', 'RTX 5060 Ti', 'GB206', 'gf', (8, 16), sms=36, bus=128)
 _add((0x2d05, 0x2f06), 'RTX 5060', 'RTX 5060', 'GB206', 'gf', 8, sms=30, bus=128)
+_add(0x2d83, 'RTX 5050', 'RTX 5050', 'GB207', 'gf', 8)
 _add(0x2684, 'RTX 4090', 'RTX 4090', 'AD102', 'gf', 24, sms=128, bus=384)
 _add(0x2685, 'RTX 4090 D', 'RTX 4090 D', 'AD102', 'gf', 24, sms=114, bus=384, note=_4090D)
 _add((0x2702, 0x2703), 'RTX 4080 SUPER', 'RTX 4080 SUPER', 'AD103', 'gf', 16, sms=80, bus=256)
@@ -250,11 +265,13 @@ _KEY_RES = [
     (re.compile(r'\bRTX PRO ?(\d{4}) ?(D?)\b'), lambda m: 'RTX PRO ' + m.group(1) + m.group(2)),
     (re.compile(r'\bRTX (\d{4})E?(?: SFF)? ?ADA\b'), lambda m: 'RTX %s ADA' % m.group(1)),
     (re.compile(r'\bRTX (A\d{4})'), lambda m: 'RTX ' + m.group(1)),
+    (re.compile(r'\bRTX ?([2-6]000) ?D\b'), lambda m: 'RTX PRO %sD' % m.group(1)),   # 驱动名“NVIDIA RTX 6000D”
     (re.compile(r'\b(RTX|GTX) ?(\d{4})( ?TI)?( ?SUPER)?( ?D)?( ?V2)?\b'),
      lambda m: ' '.join(x.strip() for x in m.groups() if x)),
     (re.compile(r'\bTITAN (RTX|V)\b'), lambda m: 'TITAN ' + m.group(1)),
     (re.compile(r'(?<![A-Z0-9])(GH200|GB200|GB300|H200|H100|H800|H20|B200|B300|B100|A100|A800|A30|A40|A16|A10G|A10|'
                 r'A2|L40S|L40|L20|L4|L2|V100S|V100|P100|P40|P4|T4)(?![0-9])'), lambda m: m.group(1)),
+    (re.compile(r'\bPG509\b'), lambda m: 'A100'),      # A100 SXM4 板卡代号，如驱动名“NVIDIA PG509-210”（0x20b2 子系统 1625）
 ]
 
 
@@ -1551,6 +1568,24 @@ def parse_expect(text):
     return dict(key=key, form=form, fam=fam, label=label)
 
 
+def unknown_check(devid, names, exp):
+    """型号库和本机 pci.ids 都不认识的设备 ID：只能参考驱动报告的名称。
+    驱动名称可能被篡改成期望的型号，所以名称相符也只能判“待确认”；但名称明确是别的型号时，可以判“不是期望型号”。"""
+    why = '设备 ID 0x%04x 不在内置型号库中，本机 pci.ids 也无法识别（可能是新型号或工程样品）' % devid
+    shown = sorted(set(nm for _, nm in names))
+    if not shown:
+        return WARN, why
+    why += '；驱动报告的名称为“%s”' % '”“'.join(shown)
+    keys = set(k for k in (model_key(nm) for nm in shown) if k)
+    if exp is not None and keys and exp['key'] not in keys:
+        return FAIL, why + '，不是 %s' % exp['fam']
+    if len(keys) > 1:
+        return WARN, why + '，各来源报告的型号不一致，无法核验'
+    if exp is not None and keys:
+        return WARN, why + '，与期望的 %s 一致，但无法用硬件 ID 独立核验' % exp['fam']
+    return WARN, why + '，无法用硬件 ID 独立核验'
+
+
 def expect_check(db, exp):
     sku, note = db['sku'], db['note']
     via = '（型号库中没有该设备 ID，按本机 pci.ids 识别）' if db.get('src') == 'pci.ids' else ''
@@ -1590,12 +1625,16 @@ def evaluate_gpu(g, target):
     keys = db_keys(db)
     mig = smi and smi.get('mig') == 'Enabled'
 
+    srcs = [('nvidia-smi', smi and smi.get('name')), ('NVML', nv and nv.get('name')),
+            ('驱动(/proc)', pr and pr.get('model')), ('CUDA', cu and cu.get('name'))]
+    names = [(src, nm) for src, nm in srcs if nm]
+
     # 1. 硬件设备 ID（PCI 配置空间，芯片熔丝决定）
     if p is None:
         add('hwid', WARN, '-', 'sysfs 中找不到该 GPU 的 PCI 设备，无法做硬件 ID 核验')
     elif db is None:
-        add('hwid', WARN, '0x%04x' % devid, '设备 ID 0x%04x 不在内置型号库中，本机 pci.ids 也无法识别（可能是工程样品或新型号）'
-            % devid)
+        lvl, why = unknown_check(devid, names, target)
+        add('hwid', lvl, '0x%04x' % devid, why)
     else:
         lvl, why = expect_check(db, target)
         add('hwid', lvl, '0x%04x' % devid, why)
@@ -1608,9 +1647,6 @@ def evaluate_gpu(g, target):
             add('cfg', FAIL, '不一致', '实时读取的设备 ID 0x%04x 与内核缓存值 0x%04x 不一致（疑似内核级伪造）'
                 % (cfg['device'], p['device']))
     # 3. 名称一致性：nvidia-smi / NVML / 驱动 /proc / CUDA 都要与硬件 ID 同一型号家族
-    srcs = [('nvidia-smi', smi and smi.get('name')), ('NVML', nv and nv.get('name')),
-            ('驱动(/proc)', pr and pr.get('model')), ('CUDA', cu and cu.get('name'))]
-    names = [(src, nm) for src, nm in srcs if nm]
     if not names:
         add('names', WARN, '无数据', '驱动未加载或 nvidia-smi/NVML 不可用，只完成了硬件 ID 核验')
     elif keys:
@@ -1786,7 +1822,10 @@ def evaluate_gpu(g, target):
     by = dict((c['key'], c) for c in checks)
     worst_crit = max([c['level'] for c in checks if c['crit']] or [OK])
     worst_all = max([c['level'] for c in checks] or [OK])
-    short = db['sku'].rsplit(' ', 1)[0] if db and re.search(r'\d+GB$', db['sku']) else (db['sku'] if db else '?')
+    if db:
+        short = db['sku'].rsplit(' ', 1)[0] if re.search(r'\d+GB$', db['sku']) else db['sku']
+    else:       # 型号库不认识：用驱动报告的名称
+        short = re.sub(r'^NVIDIA\s+(GeForce\s+)?', '', names[0][1]) if names else '?'
     hw_lvl = by.get('hwid', {}).get('level')
     other = target is not None and target['key'] not in keys     # 识别出的型号与期望不同
     if hw_lvl == FAIL:

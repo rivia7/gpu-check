@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/main/run.sh | sud
 要固定版本、不受仓库后续更新影响，就直接运行打了标签的版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/v1.2.0/h100_check.py | sudo python3 -
+curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/v1.2.1/h100_check.py | sudo python3 -
 ```
 
 ### 服务器访问不了 GitHub 时
@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/v1.2.0/h100_check
 | `--expect h100-sxm` | 默认值。必须是 H100 SXM5，即「NVLink 版」（HGX 机型），PCIe 版和 NVL 版判为「形态不符」。`h100-nvlink` 是同义写法 |
 | `--expect h100` | H100 的任何形态（SXM5 / PCIe / NVL）都算通过 |
 | `--expect h100-pcie` / `h100-nvl` | 必须是 PCIe 版 / NVL 版。注意 H100 NVL（设备 ID `0x2321`）是用 NVLink 桥连接的 PCIe 双卡，不是上面说的「NVLink 版」。形态后缀对其它型号同样适用（如 `a100-sxm`） |
-| `--expect <型号>` | 期望其它型号，如 `h20`、`a100`、`a800`、`l40s`、`l20`、`4090`、`4090d`、`5090`、`a6000`、`6000ada`。大小写、空格、`rtx` 前缀都可省略 |
+| `--expect <型号>` | 期望其它型号，如 `h20`、`a100`、`a800`、`l40s`、`l20`、`4090`、`4090d`、`5090`、`pro6000`、`pro6000d`（也可写 `6000d`）、`a6000`、`6000ada`。大小写、空格、`rtx` 前缀都可省略 |
 | `--expect any` | 不限型号，只检查各数据源是否一致、规格是否与识别出的型号吻合（比如用来检查 H20 机器本身是否正常） |
 | `--expect-gpus N` | 期望的 GPU 张数。HGX 8 卡机型（4 颗 NVSwitch）会自动按 8 张检查 |
 | `--cuda` | 额外通过 CUDA 驱动 API 读取 SM 数、显存位宽等属性，多一路交叉验证。只调用 `cuInit` 和属性查询，不创建上下文、不占显存。默认关闭 |
@@ -136,16 +136,19 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/v1.2.0/h100_check
 | `0x26b9` / `0x26ba` | L40S / **L20** | L20 为特供版 |
 | `0x2684` / `0x2685` | RTX 4090 / **RTX 4090 D** | 4090 D 为特供版，114 个 SM（4090 为 128 个） |
 | `0x2b85` / `0x2b87` / `0x2b8c` | RTX 5090 / **5090 D** / **5090 D V2** | 5090 D V2 只有 24GB、384-bit |
+| `0x2bb1` / `0x2bb4` / `0x2bb5` | RTX PRO 6000 Blackwell 工作站版 / Max-Q / 服务器版 | 188 个 SM、512-bit、96GB |
+| `0x2bb9` | **RTX PRO 6000D** 服务器版 | 特供版，驱动里叫「NVIDIA RTX 6000D」；156 个 SM、448-bit、84GB |
 
 ## 支持的型号
 
-内置型号库按设备 ID 收录了约 160 个 ID（`GPU_DB`）：
+内置型号库按设备 ID 收录了约 170 个 ID（`GPU_DB`），并与 NVIDIA 驱动的官方名称逐一核对过：
 
 - **数据中心**：H100 / H800 / H20 / H200 / GH200，B200 / B100 / GB200 / B300 / GB300，A100 / A800 / A30 / A40 / A10 / A10G / A2 / A16，L40S / L40 / L20 / L4 / L2，V100 / V100S / T4 / P100 / P40 / P4
-- **专业卡**：RTX PRO 6000 / 6000D / 5000 Blackwell，RTX 6000 / 5880 / 5000 / 4500 / 4000 / 2000 Ada，RTX A6000 / A5500 / A5000 / A4500 / A4000 / A2000，Quadro RTX 8000 / 6000 / 5000 / 4000
-- **消费级**：GeForce RTX 5090 / 5090 D / 5090 D V2 / 5080 / 5070 Ti / 5070 / 5060 Ti / 5060，RTX 4090 / 4090 D / 4080 SUPER / 4080 / 4070 Ti SUPER / 4070 Ti / 4070 SUPER / 4070 / 4060 Ti / 4060，RTX 3090 Ti / 3090 / 3080 Ti / 3080 / 3070 Ti / 3070 / 3060 Ti / 3060，RTX 2080 Ti / 2080 SUPER / 2080 / 2070 SUPER / 2070 / 2060 SUPER / 2060，TITAN RTX / TITAN V
+- **专业卡**：RTX PRO 6000 / 6000D / 5500 / 5000 / 4500 / 4000 / 2000 Blackwell，RTX 6000 / 5880 / 5000 / 4500 / 4000 / 2000 Ada，RTX A6000 / A5500 / A5000 / A4500 / A4000 / A2000，Quadro RTX 8000 / 6000 / 5000 / 4000
+- **消费级**：GeForce RTX 5090 / 5090 D / 5090 D V2 / 5080 / 5070 Ti / 5070 SUPER / 5070 / 5060 Ti / 5060 / 5050，RTX 4090 / 4090 D / 4080 SUPER / 4080 / 4070 Ti SUPER / 4070 Ti / 4070 SUPER / 4070 / 4060 Ti / 4060，RTX 3090 Ti / 3090 / 3080 Ti / 3080 / 3070 Ti / 3070 / 3060 Ti / 3060，RTX 2080 Ti / 2080 SUPER / 2080 / 2070 SUPER / 2070 / 2060 SUPER / 2060，TITAN RTX / TITAN V
 
 型号库里没有的设备 ID，会退回用本机的 pci.ids（`lspci`）识别，再与驱动、NVML、nvidia-smi 报告的名称核对，报告里会注明「按本机 pci.ids 识别」，可信度低于内置型号。
+本机 pci.ids 也不认识时（系统自带的 pci.ids 往往比新卡旧），只能参考驱动报告的名称：名称明确是别的型号，判「不是期望型号」；名称与期望相符，也只能判「待确认」，因为驱动名称可能被篡改。遇到这种情况请反馈设备 ID，补进型号库。
 
 不同类型的卡，检查侧重不同：
 
@@ -189,7 +192,7 @@ curl http://127.0.0.1/h100/     # 使用说明、可用版本、最近同步时�
 ```bash
 curl -fsSL http://<中转站>/h100/run.sh | sudo bash                        # 最新版（main）
 curl -fsSL http://<中转站>/h100/run.sh | sudo bash -s -- --expect any      # 带参数
-curl -fsSL http://<中转站>/h100/v1.2.0/run.sh | sudo bash                 # 指定版本
+curl -fsSL http://<中转站>/h100/v1.2.1/run.sh | sudo bash                 # 指定版本
 ```
 
 中转站走 HTTP 明文。链路不可信时，可以拿 `<版本>/SHA256SUMS` 里 `h100_check.py` 的哈希与 GitHub 上的文件比对。
@@ -224,5 +227,7 @@ PYTHON=python3.9 bash tests/run_tests.sh     # 指定解释器
 | `rtx4090d-fake --expect 4090` | 硬件是 4090 D，nvidia-smi 被篡改成显示 4090 → 不通过 |
 | `rtx4090-48g --expect 4090` | 改装 48GB 显存的 4090 → 通过，有告警（改装大显存） |
 | `pciids --expect any` | 设备 ID 不在型号库里，按本机 pci.ids 识别 → 通过，并注明识别来源 |
+| `rtx6000d` | 8 张 RTX PRO 6000D 服务器版（取自真实机器，驱动名「RTX 6000D」）：`--expect pro6000d` / `6000d` → 通过；`--expect pro6000` → 不通过（特供版冒充 RTX PRO 6000）；默认 → 不通过（非 H100） |
+| `unknownid` | 设备 ID 型号库和 pci.ids 都不认识：默认 → 驱动名称是别的型号，不通过；`--expect 6000d` → 名称相符，待确认 |
 
 另有 3 项测试覆盖 `run.sh`：模拟 `curl … | bash` 正常执行；下载不完整时拒绝执行；误把 `h100_check.py` 直接管道给 bash 时给出正确用法提示。

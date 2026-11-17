@@ -68,6 +68,15 @@ ARGS='--expect 4090' check rtx4090d-fake 2 '实为 RTX 4090 D，不是 RTX 4090'
     'nvidia-smi 上报设备 ID 0x2684' '文件在安装后被修改'
 ARGS='--expect 4090' check rtx4090-48g 1 '疑似改装大显存' '真 RTX 4090(改装48G显存)' '[通过，有告警]'
 ARGS='--expect any' check pciids 0 '按本机 pci.ids 识别' '真 GeForce RTX 4090'
+# RTX PRO 6000D：驱动名“NVIDIA RTX 6000D”要认作 RTX PRO 6000D；冒充 RTX PRO 6000 时判不通过
+ARGS='--expect pro6000d' check rtx6000d 0 '总体结论：[通过]' '真 RTX PRO 6000D Blackwell Server' '| 156 ' '| 448 ' '| 一致 '
+ARGS='--expect 6000d' check rtx6000d 0 '核验目标: RTX PRO 6000D（--expect 6000d）'
+ARGS='--expect pro6000' check rtx6000d 2 '实为 RTX PRO 6000D Blackwell Server，不是 RTX PRO 6000 —— 面向中国市场的特供版' \
+    '非RTX PRO 6000: RTX PRO 6000D Blackwell Server'
+check rtx6000d 2 '非H100: RTX PRO 6000D Blackwell Server'
+# 型号库和 pci.ids 都不认识的设备 ID：参考驱动名称，名称是别的型号就判不通过，名称相符只能判待确认
+check unknownid 2 '设备 ID 0x2bfe 不在内置型号库中' '驱动报告的名称为“NVIDIA RTX 6000D”，不是 H100' '非H100: RTX 6000D'
+ARGS='--expect 6000d' check unknownid 1 '与期望的 RTX PRO 6000D 一致，但无法用硬件 ID 独立核验' '总体结论：[待确认]'
 
 # ---- run.sh 一键入口：模拟 curl ... | bash（下载地址用 file://，复用上面生成的 h100 场景）
 expect_rc() {   # expect_rc <名称> <期望退出码> <实际退出码> <输出文件> <必须出现的文本>

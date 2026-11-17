@@ -37,7 +37,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from collections import Counter
 
-VERSION = '1.2.1'
+VERSION = '1.3.0'
 DEFAULT_EXPECT = 'h100-sxm'   # 默认核验 H100 SXM5，即国内常说的“NVLink 版”（HGX 机型）
 
 OK, INFO, WARN, FAIL = 0, 1, 2, 3
@@ -61,6 +61,9 @@ class G(object):
 #   sms=SM 数  bus=显存位宽(bit)  mem=显存 GB（可列多个合法值）  maxw=最大功耗墙(W)  maxsm/maxmem=最大频率(MHz)
 #   links=NVLink 链路数  strict=参考值可信度高，SM/位宽/显存偏差直接判“不通过”（其余型号只告警）
 # 型号库里没有的设备 ID，退回用本机 pci.ids（lspci）识别，再与驱动报告的名称交叉核对。
+# 来源：设备 ID 与名称取自 NVIDIA 驱动 README 的支持列表（supportedchips.html）和 pci.ids；规格取自 NVIDIA 数据表，
+# 并与 TechPowerUp（dbgpu）、维基百科交叉核对，有两个来源一致才写入，拿不准的留空（只识别型号、不比规格）。
+# 复核：python3 tools/verify_db.py --dbgpu
 # ============================================================================
 
 def _chip_arch(chip):
@@ -94,6 +97,8 @@ _4090D = '面向中国市场的特供版（114 个 SM，RTX 4090 为 128 个，�
 _5090D = '面向中国市场的特供版（AI 算力受驱动/固件限制）'
 _5090DV2 = '面向中国市场的特供版（24GB 显存、384-bit 位宽；RTX 5090 为 32GB、512-bit）'
 _6000D = '面向中国市场的特供版（156 个 SM、448-bit、84GB 显存；RTX PRO 6000 为 188 个 SM、512-bit、96GB）'
+_CMP = '挖矿专用卡（CMP 系列），没有显示输出，计算性能和 PCIe 带宽受限'
+_MINER = '挖矿专用卡（GTX 10 系核心），没有显示输出，PCIe 带宽受限'
 
 GPU_DB = {
     # ---- H100 ----
@@ -109,8 +114,8 @@ GPU_DB = {
     0x2336: _sku('H100 (GH100 变体)', 'H100', '?', None),
     0x2313: _sku('H100 CNX', 'H100', 'PCIe', 80),
     # ---- H800 / H20：特供版，不是 H100 ----
-    0x2324: _sku('H800 SXM5 80GB', 'H800', 'SXM5', 80, links=8, note=_H800),
-    0x2322: _sku('H800 PCIe 80GB', 'H800', 'PCIe', 80, note=_H800),
+    0x2324: _sku('H800 SXM5 80GB', 'H800', 'SXM5', 80, sms=132, bus=5120, maxw=700, links=8, note=_H800),
+    0x2322: _sku('H800 PCIe 80GB', 'H800', 'PCIe', 80, sms=114, bus=5120, note=_H800),
     0x233a: _sku('H800 NVL 94GB', 'H800', 'NVL', 94, note=_H800),
     0x2329: _sku('H20 96GB', 'H20', 'SXM5', 96, note=_H20),
     0x2328: _sku('H20B', 'H20', 'SXM5', None, note=_H20),
@@ -118,8 +123,8 @@ GPU_DB = {
     0x230c: _sku('H20 NVL16', 'H20', 'NVL16', None, note=_H20),
     0x230e: _sku('H20 NVL16', 'H20', 'NVL16', None, note=_H20),
     # ---- H200 / GH200 ----
-    0x2335: _sku('H200 SXM 141GB', 'H200', 'SXM5', 141, links=18),
-    0x233b: _sku('H200 NVL 141GB', 'H200', 'NVL', 141),
+    0x2335: _sku('H200 SXM 141GB', 'H200', 'SXM5', 141, sms=132, bus=6144, maxw=700, links=18),
+    0x233b: _sku('H200 NVL 141GB', 'H200', 'NVL', 141, sms=132, bus=6144),
     0x2342: _sku('GH200 Grace Hopper', 'GH200', 'Superchip', None),
     0x2348: _sku('GH200 144GB HBM3e', 'GH200', 'Superchip', 144),
     # ---- 未命名 GH100 ----
@@ -157,13 +162,15 @@ _add(0x20f5, 'A800 PCIe 80GB', 'A800', 'GA100', 'dc', 80, sms=108, bus=5120, not
 _add(0x20f6, 'A800 40GB Active', 'A800', 'GA100', 'dc', 40, sms=108, bus=5120, note=_A800)
 _add(0x2235, 'A40 48GB', 'A40', 'GA102', 'dc', 48, sms=84, bus=384, maxw=300)
 _add(0x2236, 'A10 24GB', 'A10', 'GA102', 'dc', 24, sms=72, bus=384, maxw=150)
-_add(0x2237, 'A10G 24GB', 'A10G', 'GA102', 'dc', 24, sms=80, bus=384)
+# A10G（AWS G5）：NVIDIA/AWS 数据表写 80 个 RT 核心（即 80 个 SM）、300W；TechPowerUp 写成了 A10 的 72 个 SM
+_add(0x2237, 'A10G 24GB', 'A10G', 'GA102', 'dc', 24, sms=80, bus=384, maxw=300)
+_add(0x2238, 'A10M', 'A10M', 'GA102', 'dc', None)
 _add(0x25b6, 'A2 / A16 16GB', 'A2', 'GA107', 'dc', 16, sms=10, bus=128, keys=('A2', 'A16'))
 # ---- Ada 数据中心 ----
 _add(0x26b5, 'L40 48GB', 'L40', 'AD102', 'dc', 48, sms=142, bus=384, maxw=300)
 _add(0x26b9, 'L40S 48GB', 'L40S', 'AD102', 'dc', 48, sms=142, bus=384, maxw=350)
 _add((0x26ba, 0x26b7), 'L20 48GB', 'L20', 'AD102', 'dc', 48, sms=92, bus=384, note=_L20)
-_add(0x27b8, 'L4 24GB', 'L4', 'AD104', 'dc', 24, sms=58, bus=192, maxw=72)
+_add(0x27b8, 'L4 24GB', 'L4', 'AD104', 'dc', 24, sms=58, bus=192, maxw=72)    # 7424 个 CUDA 核心 = 58 个 SM
 _add(0x27b6, 'L2', 'L2', 'AD104', 'dc', None, note=_CN)
 # ---- Turing / Volta / Pascal 数据中心 ----
 _add(0x1eb8, 'T4 16GB', 'T4', 'TU104', 'dc', 16, sms=40, bus=256, maxw=70)
@@ -175,6 +182,7 @@ _add(0x1db6, 'V100 PCIe 32GB', 'V100', 'GV100', 'dc', 32, sms=80, bus=4096, maxw
 _add(0x1db3, 'V100 FHHL 16GB', 'V100', 'GV100', 'dc', 16, sms=80, bus=4096)
 _add((0x1db2, 0x1db7), 'V100 DGXS', 'V100', 'GV100', 'dc', (16, 32), sms=80, bus=4096)
 _add(0x1df6, 'V100S PCIe 32GB', 'V100S', 'GV100', 'dc', 32, sms=80, bus=4096, maxw=250)
+_add((0x1df0, 0x1df2), 'V100 PG50x-216', 'V100', 'GV100', 'dc', None, form='?', sms=80, bus=4096)   # 驱动名 Tesla PG500/PG503-216
 _add(0x15f7, 'P100 PCIe 12GB', 'P100', 'GP100', 'dc', 12, sms=56, bus=3072, maxw=250)
 _add(0x15f8, 'P100 PCIe 16GB', 'P100', 'GP100', 'dc', 16, sms=56, bus=4096, maxw=250)
 _add(0x15f9, 'P100 SXM2 16GB', 'P100', 'GP100', 'dc', 16, form='SXM2', sms=56, bus=4096, maxw=300, links=4)
@@ -189,12 +197,12 @@ _add(0x2bb5, 'RTX PRO 6000 Blackwell Server', 'RTX PRO 6000', 'GB202', 'dc', 96,
 _add(0x2bb9, 'RTX PRO 6000D Blackwell Server', 'RTX PRO 6000D', 'GB202', 'dc', 84, sms=156, bus=448, note=_6000D)
 _add(0x2bb2, 'RTX PRO 6000D Blackwell', 'RTX PRO 6000D', 'GB202', 'ws', None, note=_6000D)
 _add(0x2bbc, 'RTX PRO 6000D Blackwell Max-Q', 'RTX PRO 6000D', 'GB202', 'ws', None, note=_6000D)
-_add(0x2bbd, 'RTX PRO 5500 Blackwell', 'RTX PRO 5500', 'GB202', 'ws', None)
-_add(0x2bb3, 'RTX PRO 5000 Blackwell', 'RTX PRO 5000', 'GB202', 'ws', (48, 72))
-_add(0x2c31, 'RTX PRO 4500 Blackwell', 'RTX PRO 4500', 'GB203', 'ws', 32)
-_add(0x2c3a, 'RTX PRO 4500 Blackwell Server', 'RTX PRO 4500', 'GB203', 'dc', 32)
-_add((0x2c34, 0x2c33), 'RTX PRO 4000 Blackwell', 'RTX PRO 4000', 'GB203', 'ws', 24)
-_add(0x2d30, 'RTX PRO 2000 Blackwell', 'RTX PRO 2000', 'GB206', 'ws', 16)
+_add(0x2bbd, 'RTX PRO 5500 Blackwell', 'RTX PRO 5500', 'GB202', 'ws', 84)
+_add(0x2bb3, 'RTX PRO 5000 Blackwell', 'RTX PRO 5000', 'GB202', 'ws', (48, 72), sms=110, bus=384)
+_add(0x2c31, 'RTX PRO 4500 Blackwell', 'RTX PRO 4500', 'GB203', 'ws', 32, sms=82, bus=256)
+_add(0x2c3a, 'RTX PRO 4500 Blackwell Server', 'RTX PRO 4500', 'GB203', 'dc', 32, sms=82, bus=256)
+_add((0x2c34, 0x2c33), 'RTX PRO 4000 Blackwell', 'RTX PRO 4000', 'GB203', 'ws', 24, sms=70, bus=192)
+_add(0x2d30, 'RTX PRO 2000 Blackwell', 'RTX PRO 2000', 'GB206', 'ws', 16, sms=34, bus=128)
 _add(0x26b1, 'RTX 6000 Ada 48GB', 'RTX 6000 Ada', 'AD102', 'ws', 48, sms=142, bus=384, maxw=300)
 _add(0x26b3, 'RTX 5880 Ada 48GB', 'RTX 5880 Ada', 'AD102', 'ws', 48, sms=110, bus=384)
 _add(0x26b2, 'RTX 5000 Ada 32GB', 'RTX 5000 Ada', 'AD102', 'ws', 32, sms=100, bus=256, maxw=250)
@@ -214,6 +222,24 @@ _add((0x1e30, 0x1e78), 'Quadro RTX 6000/8000', 'RTX 6000', 'TU102', 'ws', (24, 4
 _add(0x1e36, 'Quadro RTX 6000', 'RTX 6000', 'TU102', 'ws', 24, sms=72, bus=384)
 _add(0x1eb0, 'Quadro RTX 5000', 'RTX 5000', 'TU104', 'ws', 16, sms=48, bus=256)
 _add(0x1eb1, 'Quadro RTX 4000', 'RTX 4000', 'TU104', 'ws', 8, sms=36, bus=256)
+_add(0x25b0, 'RTX A1000 8GB', 'RTX A1000', 'GA107', 'ws', 8, sms=18, bus=128)
+_add(0x25b2, 'RTX A400 4GB', 'RTX A400', 'GA107', 'ws', 4, sms=6, bus=64)
+_add(0x1fb0, 'T1000 4GB', 'T1000', 'TU117', 'ws', 4, sms=14, bus=128)       # 驱动名也可能是“NVIDIA DGX Display”
+_add(0x1ff0, 'T1000 8GB', 'T1000', 'TU117', 'ws', 8, sms=14, bus=128)
+_add(0x1fb1, 'T600 4GB', 'T600', 'TU117', 'ws', 4, sms=10, bus=128)
+_add(0x1fb2, 'T400', 'T400', 'TU117', 'ws', (2, 4), sms=6, bus=64)
+_add(0x1ff2, 'T400 4GB', 'T400', 'TU117', 'ws', 4, sms=6, bus=64)
+_add(0x1dba, 'Quadro GV100 32GB', 'Quadro GV100', 'GV100', 'ws', 32, sms=80, bus=4096, keys=('Quadro GV100', 'TITAN V'))
+_add(0x1b30, 'Quadro P6000 24GB', 'Quadro P6000', 'GP102', 'ws', 24, sms=30, bus=384)
+_add(0x1bb0, 'Quadro P5000 16GB', 'Quadro P5000', 'GP104', 'ws', 16, sms=20, bus=256)
+_add(0x1bb1, 'Quadro P4000 8GB', 'Quadro P4000', 'GP104', 'ws', 8, sms=14, bus=256)
+_add(0x1c31, 'Quadro P2200 5GB', 'Quadro P2200', 'GP106', 'ws', 5, sms=10, bus=160)
+_add(0x1c30, 'Quadro P2000 5GB', 'Quadro P2000', 'GP106', 'ws', 5, sms=8, bus=160)
+_add(0x1cfa, 'Quadro P2000 (GP107)', 'Quadro P2000', 'GP107', 'ws', None)
+_add((0x1cb1, 0x1cfb), 'Quadro P1000 4GB', 'Quadro P1000', 'GP107', 'ws', 4, bus=128)
+_add(0x1cb6, 'Quadro P620 2GB', 'Quadro P620', 'GP107', 'ws', 2, sms=4, bus=128)
+_add(0x1cb2, 'Quadro P600 2GB', 'Quadro P600', 'GP107', 'ws', 2, sms=3, bus=128)
+_add(0x1cb3, 'Quadro P400 2GB', 'Quadro P400', 'GP107', 'ws', 2, sms=2, bus=64)
 # ---- 消费级 GeForce RTX 50 / 40 / 30 / 20 与 TITAN（功耗墙和频率随板卡厂商不同，不做比对）----
 _add(0x2b85, 'RTX 5090', 'RTX 5090', 'GB202', 'gf', 32, sms=170, bus=512)
 _add(0x2b87, 'RTX 5090 D', 'RTX 5090 D', 'GB202', 'gf', 32, sms=170, bus=512, note=_5090D)
@@ -224,7 +250,7 @@ _add(0x2f02, 'RTX 5070 SUPER', 'RTX 5070 SUPER', 'GB205', 'gf', None)
 _add((0x2f04, 0x2c09), 'RTX 5070', 'RTX 5070', 'GB205', 'gf', 12, sms=48, bus=192)
 _add(0x2d04, 'RTX 5060 Ti', 'RTX 5060 Ti', 'GB206', 'gf', (8, 16), sms=36, bus=128)
 _add((0x2d05, 0x2f06), 'RTX 5060', 'RTX 5060', 'GB206', 'gf', 8, sms=30, bus=128)
-_add(0x2d83, 'RTX 5050', 'RTX 5050', 'GB207', 'gf', 8)
+_add(0x2d83, 'RTX 5050', 'RTX 5050', 'GB207', 'gf', 8, sms=20, bus=128)
 _add(0x2684, 'RTX 4090', 'RTX 4090', 'AD102', 'gf', 24, sms=128, bus=384)
 _add(0x2685, 'RTX 4090 D', 'RTX 4090 D', 'AD102', 'gf', 24, sms=114, bus=384, note=_4090D)
 _add((0x2702, 0x2703), 'RTX 4080 SUPER', 'RTX 4080 SUPER', 'AD103', 'gf', 16, sms=80, bus=256)
@@ -247,6 +273,10 @@ _add((0x2484, 0x2488, 0x248d), 'RTX 3070', 'RTX 3070', 'GA104', 'gf', 8, sms=46,
 _add((0x2486, 0x2489, 0x248e, 0x24c9, 0x2414), 'RTX 3060 Ti', 'RTX 3060 Ti', 'GA104', 'gf', 8, sms=38, bus=256)
 _add((0x2503, 0x2504, 0x2509, 0x2544, 0x2487), 'RTX 3060 12GB', 'RTX 3060', 'GA106', 'gf', 12, sms=28, bus=192)
 _add(0x24c7, 'RTX 3060 8GB', 'RTX 3060', 'GA104', 'gf', 8, sms=28, bus=128)
+_add(0x2507, 'RTX 3050 8GB', 'RTX 3050', 'GA106', 'gf', 8, sms=20, bus=128)
+_add(0x2582, 'RTX 3050 8GB', 'RTX 3050', 'GA107', 'gf', 8, sms=20, bus=128)
+_add(0x2508, 'RTX 3050 OEM 8GB', 'RTX 3050', 'GA106', 'gf', 8, sms=18, bus=128)
+_add(0x2584, 'RTX 3050 6GB', 'RTX 3050', 'GA107', 'gf', 6, sms=18, bus=96)
 _add((0x1e04, 0x1e07), 'RTX 2080 Ti', 'RTX 2080 Ti', 'TU102', 'gf', 11, sms=68, bus=352)
 _add(0x1e81, 'RTX 2080 SUPER', 'RTX 2080 SUPER', 'TU104', 'gf', 8, sms=48, bus=256)
 _add((0x1e82, 0x1e87), 'RTX 2080', 'RTX 2080', 'TU104', 'gf', 8, sms=46, bus=256)
@@ -257,6 +287,37 @@ _add((0x1f08, 0x1e89), 'RTX 2060', 'RTX 2060', 'TU106', 'gf', 6, sms=30, bus=192
 _add(0x1f03, 'RTX 2060 12GB', 'RTX 2060', 'TU106', 'gf', 12, sms=34, bus=192)
 _add(0x1e02, 'TITAN RTX', 'TITAN RTX', 'TU102', 'gf', 24, sms=72, bus=384)
 _add(0x1d81, 'TITAN V', 'TITAN V', 'GV100', 'gf', 12, sms=80, bus=3072)
+_add(0x2182, 'GTX 1660 Ti', 'GTX 1660 Ti', 'TU116', 'gf', 6, sms=24, bus=192)
+_add(0x21c4, 'GTX 1660 SUPER', 'GTX 1660 SUPER', 'TU116', 'gf', 6, sms=22, bus=192)
+_add(0x2184, 'GTX 1660', 'GTX 1660', 'TU116', 'gf', 6, sms=22, bus=192)
+_add(0x2187, 'GTX 1650 SUPER', 'GTX 1650 SUPER', 'TU116', 'gf', 4, sms=20, bus=128)
+_add((0x1f82, 0x1f0a, 0x2188), 'GTX 1650', 'GTX 1650', 'TU117', 'gf', 4, sms=14, bus=128)
+_add(0x1f83, 'GTX 1630', 'GTX 1630', 'TU117', 'gf', 4, sms=8, bus=64)
+_add(0x1b02, 'TITAN Xp', 'TITAN Xp', 'GP102', 'gf', 12, sms=30, bus=384)
+_add(0x1b00, 'TITAN X (Pascal)', 'TITAN X', 'GP102', 'gf', 12, sms=28, bus=384)
+_add(0x1b06, 'GTX 1080 Ti', 'GTX 1080 Ti', 'GP102', 'gf', 11, sms=28, bus=352)
+_add(0x1b80, 'GTX 1080', 'GTX 1080', 'GP104', 'gf', 8, sms=20, bus=256)
+_add(0x1b82, 'GTX 1070 Ti', 'GTX 1070 Ti', 'GP104', 'gf', 8, sms=19, bus=256)
+_add(0x1b81, 'GTX 1070', 'GTX 1070', 'GP104', 'gf', 8, sms=15, bus=256)
+_add((0x1c03, 0x1c06, 0x1b83), 'GTX 1060 6GB', 'GTX 1060', 'GP106', 'gf', 6, sms=10, bus=192)
+_add(0x1c04, 'GTX 1060 5GB', 'GTX 1060', 'GP106', 'gf', 5, sms=10, bus=160)
+_add((0x1c02, 0x1b84), 'GTX 1060 3GB', 'GTX 1060', 'GP106', 'gf', 3, sms=9, bus=192)
+_add(0x1c82, 'GTX 1050 Ti', 'GTX 1050 Ti', 'GP107', 'gf', 4, sms=6, bus=128)
+_add(0x1c81, 'GTX 1050 2GB', 'GTX 1050', 'GP107', 'gf', 2, sms=5, bus=128)
+_add(0x1c83, 'GTX 1050 3GB', 'GTX 1050', 'GP107', 'gf', 3, sms=6, bus=96)
+_add(0x1d01, 'GT 1030', 'GT 1030', 'GP108', 'gf', 2, sms=3, bus=64)
+_add(0x1d02, 'GT 1010', 'GT 1010', 'GP108', 'gf', 2, sms=2, bus=64)
+# ---- 矿卡：没有显示输出，常被刷 BIOS 冒充游戏卡或计算卡出售 ----
+_add(0x20c2, 'CMP 170HX', 'CMP 170HX', 'GA100', 'gf', (8, 10), sms=70, note=_CMP)
+_add(0x220d, 'CMP 90HX', 'CMP 90HX', 'GA102', 'gf', 10, sms=50, bus=320, note=_CMP)
+_add(0x248a, 'CMP 70HX', 'CMP 70HX', 'GA104', 'gf', 8, bus=256, note=_CMP)
+_add(0x1e09, 'CMP 50HX', 'CMP 50HX', 'TU102', 'gf', 10, sms=56, bus=320, note=_CMP)
+_add(0x1f0b, 'CMP 40HX', 'CMP 40HX', 'TU106', 'gf', 8, sms=36, bus=256, note=_CMP)
+_add(0x2189, 'CMP 30HX', 'CMP 30HX', 'TU116', 'gf', 6, sms=22, bus=192, note=_CMP)
+_add(0x1b87, 'P104-100', 'P104-100', 'GP104', 'gf', None, note=_MINER)
+_add(0x1bc7, 'P104-101', 'P104-101', 'GP104', 'gf', None, note=_MINER)
+_add(0x1c07, 'P106-100', 'P106-100', 'GP106', 'gf', 6, note=_MINER)
+_add(0x1c09, 'P106-090', 'P106-090', 'GP106', 'gf', 3, note=_MINER)
 
 
 # 从型号名称里提取“型号键”，用来比对不同来源报告的是不是同一型号：
@@ -264,13 +325,23 @@ _add(0x1d81, 'TITAN V', 'TITAN V', 'GV100', 'gf', 12, sms=80, bus=3072)
 _KEY_RES = [
     (re.compile(r'\bRTX PRO ?(\d{4}) ?(D?)\b'), lambda m: 'RTX PRO ' + m.group(1) + m.group(2)),
     (re.compile(r'\bRTX (\d{4})E?(?: SFF)? ?ADA\b'), lambda m: 'RTX %s ADA' % m.group(1)),
-    (re.compile(r'\bRTX (A\d{4})'), lambda m: 'RTX ' + m.group(1)),
+    (re.compile(r'\bRTX (A\d{3,4})(?![0-9])'), lambda m: 'RTX ' + m.group(1)),
     (re.compile(r'\bRTX ?([2-6]000) ?D\b'), lambda m: 'RTX PRO %sD' % m.group(1)),   # 驱动名“NVIDIA RTX 6000D”
     (re.compile(r'\b(RTX|GTX) ?(\d{4})( ?TI)?( ?SUPER)?( ?D)?( ?V2)?\b'),
      lambda m: ' '.join(x.strip() for x in m.groups() if x)),
-    (re.compile(r'\bTITAN (RTX|V)\b'), lambda m: 'TITAN ' + m.group(1)),
-    (re.compile(r'(?<![A-Z0-9])(GH200|GB200|GB300|H200|H100|H800|H20|B200|B300|B100|A100|A800|A30|A40|A16|A10G|A10|'
+    (re.compile(r'\bGT ?(\d{4})\b'), lambda m: 'GT ' + m.group(1)),
+    (re.compile(r'\bGTX TITAN( X| Z| BLACK)?\b'), lambda m: 'GTX TITAN' + (m.group(1) or '')),   # Maxwell/Kepler，不是 Pascal 的 TITAN X
+    (re.compile(r'\bTITAN (RTX|XP|X|V)\b'), lambda m: 'TITAN ' + m.group(1)),
+    (re.compile(r'\bQUADRO (GV100|GP100)\b'), lambda m: 'QUADRO ' + m.group(1)),
+    (re.compile(r'(?<![A-Z0-9])(P(?:400|600|620|1000|2000|2200|4000|5000|6000))(?![0-9])'), lambda m: 'QUADRO ' + m.group(1)),
+    (re.compile(r'(?<![A-Z0-9])(T(?:400|600|1000))(?![0-9])'), lambda m: m.group(1)),
+    (re.compile(r'\bDGX DISPLAY\b'), lambda m: 'T1000'),
+    (re.compile(r'\bMATROX D SERIES D14[58]0\b'), lambda m: 'QUADRO P1000'),   # Matrox 多屏卡，Quadro P1000 芯片
+    (re.compile(r'\bCMP ?(\d{2,3}) ?HX\b'), lambda m: 'CMP %sHX' % m.group(1)),
+    (re.compile(r'\bP(10[46]) ?(\d{3})\b'), lambda m: 'P%s-%s' % m.groups()),       # 矿卡 P104-100 / P106-100
+    (re.compile(r'(?<![A-Z0-9])(GH200|GB200|GB300|H200|H100|H800|H20|B200|B300|B100|A100|A800|A30|A40|A16|A10M|A10G|A10|'
                 r'A2|L40S|L40|L20|L4|L2|V100S|V100|P100|P40|P4|T4)(?![0-9])'), lambda m: m.group(1)),
+    (re.compile(r'\bPG50[03]\b'), lambda m: 'V100'),     # V100 定制板卡，驱动名“Tesla PG500-216 / PG503-216”
     (re.compile(r'\bPG509\b'), lambda m: 'A100'),      # A100 SXM4 板卡代号，如驱动名“NVIDIA PG509-210”（0x20b2 子系统 1625）
 ]
 
@@ -1555,8 +1626,8 @@ def parse_expect(text):
     m = re.match(r'^(.+?)[-_ ]?(sxm\d?|nvlink|pcie|nvl)$', t, re.I)
     if m:      # nvlink = sxm：国内说的“NVLink 版”就是 SXM 模组（HGX 机型）；H100 NVL 是带 NVLink 桥的 PCIe 卡
         t, form = m.group(1), {'NVLINK': 'SXM', 'PCIE': 'PCIE', 'NVL': 'NVL'}.get(m.group(2).upper(), 'SXM')
-    key = model_key(t) or model_key('RTX ' + t)
-    if not key or key not in KNOWN_KEYS:
+    key = next((k for k in (model_key(c) for c in (t, 'RTX ' + t, 'GTX ' + t, 'GT ' + t)) if k in KNOWN_KEYS), None)
+    if not key:
         return False
     fam = next((d['family'] for d in GPU_DB.values() if d['family'].upper() == key), key)
     label = fam

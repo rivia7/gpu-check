@@ -168,7 +168,11 @@ int cuDeviceGetName(char *s, int len, int d) { snprintf(s, (size_t)len, "%s", gp
 int cuDeviceGetAttribute(int *v, int attr, int d) {
     gpu_t *g = &gpus[d];
     switch (attr) {
-        case 16: *v = (int)(g->cores / 128); break;   /* MULTIPROCESSOR_COUNT */
+        case 16: {                                    /* MULTIPROCESSOR_COUNT：GP100/Volta/Turing/GA100 每 SM 64 核 */
+            int c64 = (g->ccmaj == 6 && g->ccmin == 0) || g->ccmaj == 7 || (g->ccmaj == 8 && g->ccmin == 0);
+            *v = (int)(g->cores / (c64 ? 64 : 128));
+            break;
+        }
         case 37: *v = (int)g->buswidth; break;        /* GLOBAL_MEMORY_BUS_WIDTH */
         case 38: *v = 50 * 1024 * 1024; break;        /* L2_CACHE_SIZE */
         case 75: *v = g->ccmaj; break;

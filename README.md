@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/main/run.sh | sud
 要固定版本、不受仓库后续更新影响，就直接运行打了标签的版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/v1.2.1/h100_check.py | sudo python3 -
+curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/v1.3.0/h100_check.py | sudo python3 -
 ```
 
 ### 服务器访问不了 GitHub 时
@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/v1.2.1/h100_check
 | `--expect h100-sxm` | 默认值。必须是 H100 SXM5，即「NVLink 版」（HGX 机型），PCIe 版和 NVL 版判为「形态不符」。`h100-nvlink` 是同义写法 |
 | `--expect h100` | H100 的任何形态（SXM5 / PCIe / NVL）都算通过 |
 | `--expect h100-pcie` / `h100-nvl` | 必须是 PCIe 版 / NVL 版。注意 H100 NVL（设备 ID `0x2321`）是用 NVLink 桥连接的 PCIe 双卡，不是上面说的「NVLink 版」。形态后缀对其它型号同样适用（如 `a100-sxm`） |
-| `--expect <型号>` | 期望其它型号，如 `h20`、`a100`、`a800`、`l40s`、`l20`、`4090`、`4090d`、`5090`、`pro6000`、`pro6000d`（也可写 `6000d`）、`a6000`、`6000ada`。大小写、空格、`rtx` 前缀都可省略 |
+| `--expect <型号>` | 期望其它型号，如 `h20`、`a100`、`a800`、`l40s`、`l20`、`4090`、`4090d`、`5090`、`pro6000`、`pro6000d`（也可写 `6000d`）、`a6000`、`6000ada`、`1080ti`、`p6000`、`t1000`、`cmp170hx`。大小写、空格、`rtx` / `gtx` 前缀都可省略 |
 | `--expect any` | 不限型号，只检查各数据源是否一致、规格是否与识别出的型号吻合（比如用来检查 H20 机器本身是否正常） |
 | `--expect-gpus N` | 期望的 GPU 张数。HGX 8 卡机型（4 颗 NVSwitch）会自动按 8 张检查 |
 | `--cuda` | 额外通过 CUDA 驱动 API 读取 SM 数、显存位宽等属性，多一路交叉验证。只调用 `cuInit` 和属性查询，不创建上下文、不占显存。默认关闭 |
@@ -138,14 +138,16 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/v1.2.1/h100_check
 | `0x2b85` / `0x2b87` / `0x2b8c` | RTX 5090 / **5090 D** / **5090 D V2** | 5090 D V2 只有 24GB、384-bit |
 | `0x2bb1` / `0x2bb4` / `0x2bb5` | RTX PRO 6000 Blackwell 工作站版 / Max-Q / 服务器版 | 188 个 SM、512-bit、96GB |
 | `0x2bb9` | **RTX PRO 6000D** 服务器版 | 特供版，驱动里叫「NVIDIA RTX 6000D」；156 个 SM、448-bit、84GB |
+| `0x20c2` | **CMP 170HX** | 矿卡，和 A100 同为 GA100 核心，但只有 70 个 SM（A100 为 108 个）、8GB 显存 |
 
 ## 支持的型号
 
-内置型号库按设备 ID 收录了约 170 个 ID（`GPU_DB`），并与 NVIDIA 驱动的官方名称逐一核对过：
+内置型号库（`GPU_DB`）按设备 ID 收录了 235 个 ID，覆盖 Pascal 到 Blackwell 的台式机和服务器 GPU。每个 ID 的官方名称都与 NVIDIA 驱动的支持列表核对过，规格的来源见下一节：
 
-- **数据中心**：H100 / H800 / H20 / H200 / GH200，B200 / B100 / GB200 / B300 / GB300，A100 / A800 / A30 / A40 / A10 / A10G / A2 / A16，L40S / L40 / L20 / L4 / L2，V100 / V100S / T4 / P100 / P40 / P4
-- **专业卡**：RTX PRO 6000 / 6000D / 5500 / 5000 / 4500 / 4000 / 2000 Blackwell，RTX 6000 / 5880 / 5000 / 4500 / 4000 / 2000 Ada，RTX A6000 / A5500 / A5000 / A4500 / A4000 / A2000，Quadro RTX 8000 / 6000 / 5000 / 4000
-- **消费级**：GeForce RTX 5090 / 5090 D / 5090 D V2 / 5080 / 5070 Ti / 5070 SUPER / 5070 / 5060 Ti / 5060 / 5050，RTX 4090 / 4090 D / 4080 SUPER / 4080 / 4070 Ti SUPER / 4070 Ti / 4070 SUPER / 4070 / 4060 Ti / 4060，RTX 3090 Ti / 3090 / 3080 Ti / 3080 / 3070 Ti / 3070 / 3060 Ti / 3060，RTX 2080 Ti / 2080 SUPER / 2080 / 2070 SUPER / 2070 / 2060 SUPER / 2060，TITAN RTX / TITAN V
+- **数据中心**：H100 / H800 / H20 / H200 / GH200，B200 / B100 / GB200 / B300 / GB300，A100 / A800 / A30 / A40 / A10 / A10G / A10M / A2 / A16，L40S / L40 / L20 / L4 / L2，V100 / V100S / T4 / P100 / P40 / P4
+- **专业卡**：RTX PRO 6000 / 6000D / 5500 / 5000 / 4500 / 4000 / 2000 Blackwell，RTX 6000 / 5880 / 5000 / 4500 / 4000 / 2000 Ada，RTX A6000 / A5500 / A5000 / A4500 / A4000 / A2000 / A1000 / A400，Quadro RTX 8000 / 6000 / 5000 / 4000，T1000 / T600 / T400，Quadro GV100，Quadro P6000 / P5000 / P4000 / P2200 / P2000 / P1000 / P620 / P600 / P400
+- **消费级**：GeForce RTX 5090 / 5090 D / 5090 D V2 / 5080 / 5070 Ti / 5070 SUPER / 5070 / 5060 Ti / 5060 / 5050，RTX 4090 / 4090 D / 4080 SUPER / 4080 / 4070 Ti SUPER / 4070 Ti / 4070 SUPER / 4070 / 4060 Ti / 4060，RTX 3090 Ti / 3090 / 3080 Ti / 3080 / 3070 Ti / 3070 / 3060 Ti / 3060 / 3050，RTX 2080 Ti / 2080 SUPER / 2080 / 2070 SUPER / 2070 / 2060 SUPER / 2060，GTX 1660 Ti / 1660 SUPER / 1660 / 1650 SUPER / 1650 / 1630，GTX 1080 Ti / 1080 / 1070 Ti / 1070 / 1060 / 1050 Ti / 1050，GT 1030 / 1010，TITAN RTX / TITAN V / TITAN Xp / TITAN X (Pascal)
+- **矿卡**：CMP 170HX / 90HX / 70HX / 50HX / 40HX / 30HX，P104-100 / P104-101 / P106-100 / P106-090。这些卡没有显示输出、PCIe 带宽受限，期望别的型号时，报告会注明是「挖矿专用卡」
 
 型号库里没有的设备 ID，会退回用本机的 pci.ids（`lspci`）识别，再与驱动、NVML、nvidia-smi 报告的名称核对，报告里会注明「按本机 pci.ids 识别」，可信度低于内置型号。
 本机 pci.ids 也不认识时（系统自带的 pci.ids 往往比新卡旧），只能参考驱动报告的名称：名称明确是别的型号，判「不是期望型号」；名称与期望相符，也只能判「待确认」，因为驱动名称可能被篡改。遇到这种情况请反馈设备 ID，补进型号库。
@@ -156,11 +158,53 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/v1.2.1/h100_check
 - **改装大显存**（如 48GB 的 RTX 4090、22GB 的 RTX 2080 Ti）：显存明显大于官方规格时，结论为「真 RTX 4090(改装48G显存)」并给出告警。芯片是真的，但板卡不是原厂设计，要留意稳定性和保修。
 - **数据中心卡**关闭 ECC 时告警。GDDR 显存开 ECC 会占掉 1/16 容量，两种容量都按标准处理。
 
+## 型号库的来源与核实
+
+网上找过现成的 GPU 数据库，没有能直接用的。真伪核验要把「熔丝设备 ID」和「SM 数、显存位宽、显存容量、功耗墙」对应起来，现有项目要么只有设备 ID 和名称，要么只有规格、没有设备 ID：
+
+| 项目 | 内容 | 缺什么 |
+|---|---|---|
+| NVIDIA 驱动 README 的[支持列表](https://download.nvidia.com/XFree86/Linux-x86_64/620.70.06/README/supportedchips.html) | 官方的设备 ID 与名称 | 没有规格 |
+| [pciutils/pciids](https://github.com/pciutils/pciids) | 设备 ID、名称和芯片代号，社区维护 | 没有规格 |
+| [chaneyzorn/nvidia-gpu-hwdata](https://github.com/chaneyzorn/nvidia-gpu-hwdata) | 从驱动支持列表整理的设备 ID 与名称 | 没有规格，2024 年后没有更新 |
+| [dbgpu](https://github.com/painebenjamin/dbgpu)（数据来自 TechPowerUp） | 1400 多款 NVIDIA GPU 的详细规格 | 没有设备 ID，个别数值有误（见下表） |
+| [RightNow-AI/RightNow-GPU-Database](https://github.com/RightNow-AI/RightNow-GPU-Database) | 同样来自 TechPowerUp，JSON 格式 | 没有设备 ID |
+| [voidful/gpu-info-api](https://github.com/voidful/gpu-info-api) | 从维基百科抓取的规格表 | 没有设备 ID，字段不统一 |
+| [gmasse/gpu-specs](https://github.com/gmasse/gpu-specs)、Hugging Face 上的 [Jr23xd23/gpu-database](https://huggingface.co/datasets/Jr23xd23/gpu-database) | 面向 AI 选型的规格表 | 没有设备 ID |
+
+所以型号库是把这几类数据拼起来的，规则如下：
+
+- **设备 ID 和名称**：以 NVIDIA 驱动的支持列表为准；驱动没收录的 ID 取自 pci.ids。
+- **规格**：取自 NVIDIA 数据表和产品页，再与 TechPowerUp（dbgpu）、维基百科交叉核对。有两个来源一致，或有官方的明确数值，才写入；拿不准的留空，这类型号只按设备 ID 识别，不比对规格。
+- **范围**：只收 Pascal 及以后的台式机和服务器 GPU。笔记本和嵌入式 GPU、工程板卡（如 PG506-232）、资料不足的新品（GB10、Rubin）暂不收录，遇到时按 pci.ids 和驱动名称识别。
+
+2026-11-17 的核对结果：
+
+- 驱动 620.70.06 和 580.178.04 的支持列表里，型号库 ID 对应的 229 个官方名称全部识别正确；驱动没收录的 27 个 ID 与 pci.ids 的名称一致。
+- 规格与 TechPowerUp 比对，163 项一致，6 项不一致。查证后都是 TechPowerUp 的数值有误：
+
+| 型号 | TechPowerUp | 型号库（依据） |
+|---|---|---|
+| V100 SXM2 16GB / 32GB | 250W | 300W（NVIDIA V100 数据表） |
+| V100 PCIe 16GB | 300W | 250W（NVIDIA V100 数据表） |
+| A10G | 72 个 SM、150W | 80 个 SM、300W（NVIDIA/AWS 的 A10G 数据表：80 个 RT 核心，每个 SM 一个） |
+| L40S | 300W | 350W（NVIDIA L40S 产品页） |
+| L4 | 60 个 SM | 58 个 SM（7424 个 CUDA 核心 ÷ 128） |
+
+- 只有一个来源的规格不写入。比如 TechPowerUp 给 RTX PRO 6000D 工作站版和 Max-Q 版填的是 RTX PRO 6000 的数值，型号库只收录了从真实机器核实过的服务器版规格。
+
+维护者可以随时复核（需要联网，GPU 服务器上用不到）：
+
+```bash
+python3 -I tools/verify_db.py            # 核对官方名称，列出官方列表里有、型号库还没有的 ID
+python3 -I tools/verify_db.py --dbgpu    # 另外与 TechPowerUp 数据比对规格
+```
+
 ## 局限
 
 - **内核级伪造防不住**：如果有人改了内核（例如修改开源内核模块，或在 PCI 层伪造设备 ID），所有软件读到的数据都可能是假的。脚本会显示内核模块的 srcversion 和 taint 标志，可与同版本的正常机器比对。
 - **不做算力实测**：要确认实际算力，需要在维护窗口对空闲 GPU 单独压测（比如跑 BF16 GEMM：H100 SXM5 稠密 BF16 理论约 989 TFLOPS，H20 约 148 TFLOPS）。这会占用 GPU，所以脚本有意不做。
-- 规格表里 H20、H800 的部分数值（SM 数、功耗等）以硬件 ID 判定为主，规格只作辅助参考。新增型号的规格取自官方公开参数，偏差时只告警。
+- H20 系列等特供型号没有官方公开的完整规格，判定以硬件 ID 为主，规格只作辅助参考。型号库只写入有可靠来源的规格（见「型号库的来源与核实」），非关键项有偏差时只告警。
 - H100 检测目前只在模拟环境里测试过（见下节），还没在真实 H100 机器上跑过。首次使用建议先在一台确定是正品的机器上跑一遍，作为基线对照。RTX 4090 的测试场景取自一台真实机器的报告。
 
 ## 自建中转
@@ -192,7 +236,7 @@ curl http://127.0.0.1/h100/     # 使用说明、可用版本、最近同步时�
 ```bash
 curl -fsSL http://<中转站>/h100/run.sh | sudo bash                        # 最新版（main）
 curl -fsSL http://<中转站>/h100/run.sh | sudo bash -s -- --expect any      # 带参数
-curl -fsSL http://<中转站>/h100/v1.2.1/run.sh | sudo bash                 # 指定版本
+curl -fsSL http://<中转站>/h100/v1.3.0/run.sh | sudo bash                 # 指定版本
 ```
 
 中转站走 HTTP 明文。链路不可信时，可以拿 `<版本>/SHA256SUMS` 里 `h100_check.py` 的哈希与 GitHub 上的文件比对。
@@ -229,5 +273,6 @@ PYTHON=python3.9 bash tests/run_tests.sh     # 指定解释器
 | `pciids --expect any` | 设备 ID 不在型号库里，按本机 pci.ids 识别 → 通过，并注明识别来源 |
 | `rtx6000d` | 8 张 RTX PRO 6000D 服务器版（取自真实机器，驱动名「RTX 6000D」）：`--expect pro6000d` / `6000d` → 通过；`--expect pro6000` → 不通过（特供版冒充 RTX PRO 6000）；默认 → 不通过（非 H100） |
 | `unknownid` | 设备 ID 型号库和 pci.ids 都不认识：默认 → 驱动名称是别的型号，不通过；`--expect 6000d` → 名称相符，待确认 |
+| `cmp170hx` | 8 张 CMP 170HX 矿卡（GA100 核心）：`--expect a100` → 不通过，注明是挖矿专用卡；`--expect any` → 通过，识别为 CMP 170HX（70 个 SM） |
 
-另有 3 项测试覆盖 `run.sh`：模拟 `curl … | bash` 正常执行；下载不完整时拒绝执行；误把 `h100_check.py` 直接管道给 bash 时给出正确用法提示。
+此外还有 4 项测试：`tests/test_keys.py` 检查型号名称规则，驱动的官方名称、`--expect` 的各种写法都要识别成正确的型号，型号库每条记录都要自洽；另外 3 项覆盖 `run.sh`：模拟 `curl … | bash` 正常执行；下载不完整时拒绝执行；误把 `h100_check.py` 直接管道给 bash 时给出正确用法提示。

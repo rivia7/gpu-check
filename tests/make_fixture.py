@@ -21,6 +21,7 @@
   pciids         设备 ID 不在内置型号库里（虚构的 0x26ff），只能靠本机 pci.ids（lspci）识别
   rtx6000d       8 张 RTX PRO 6000D 服务器版（0x2bb9，驱动名“NVIDIA RTX 6000D”；数值取自一台真实机器的报告）
   unknownid      驱动名同上，但设备 ID 型号库和 pci.ids 都不认识（虚构的 0x2bfe）
+  cmp170hx       8 张 CMP 170HX 矿卡（GA100 核心，常被冒充成 A100）
 注意：H20/H800 的功耗、SM 数等数值只是测试占位，不代表真实规格。
 """
 import os
@@ -63,6 +64,9 @@ SPEC['rtx6000d'] = dict(devid=0x2bb9, subsys=0x2091, name='NVIDIA RTX 6000D', me
                         inforom='G153.0235.00.02', arch='Blackwell', cc='12.0', brand='NVIDIA RTX', gen=5,
                         ecc='Enabled', vbios='98.02.81.00.02', util=0)
 SPEC['unknownid'] = dict(SPEC['rtx6000d'], devid=0x2bfe, pn='2BFE-891-A1')
+SPEC['cmp170hx'] = dict(devid=0x20c2, subsys=0x1590, name='NVIDIA CMP 170HX', mem=8110, cores=70 * 64, bus=4096,
+                        maxw=250, maxsm=1410, maxmem=1458, links=0, pn='20C2-893-A1', board_pn='N/A',
+                        inforom='G506.0230.00.01', arch='Ampere', cc='8.0', gen=4, ecc='Disabled', util=0)
 # 各场景：真实硬件用哪份规格；nvidia-smi 被篡改的场景另指定 nvidia-smi 显示的规格
 HW_OF = {'h20-fake': 'h20', 'rtx4090d-fake': 'rtx4090d'}
 SMI_OF = {'h20-fake': 'h100', 'rtx4090d-fake': 'rtx4090'}

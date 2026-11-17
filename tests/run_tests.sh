@@ -77,6 +77,16 @@ check rtx6000d 2 '非H100: RTX PRO 6000D Blackwell Server'
 # 型号库和 pci.ids 都不认识的设备 ID：参考驱动名称，名称是别的型号就判不通过，名称相符只能判待确认
 check unknownid 2 '设备 ID 0x2bfe 不在内置型号库中' '驱动报告的名称为“NVIDIA RTX 6000D”，不是 H100' '非H100: RTX 6000D'
 ARGS='--expect 6000d' check unknownid 1 '与期望的 RTX PRO 6000D 一致，但无法用硬件 ID 独立核验' '总体结论：[待确认]'
+# 矿卡：CMP 170HX 是 GA100 核心，冒充 A100 时判不通过
+ARGS='--expect a100' check cmp170hx 2 '实为 CMP 170HX，不是 A100 —— 挖矿专用卡' '非A100: CMP 170HX'
+ARGS='--expect any' check cmp170hx 0 '真 CMP 170HX' '| 70 '
+
+# ---- 型号名称识别规则与型号库自洽性（不需要夹具）
+if "$PY" "$HERE/test_keys.py" >"${OUT}/keys.txt" 2>&1; then
+    echo "PASS 型号名称规则（$(tail -1 "${OUT}/keys.txt")）"; pass=$((pass + 1))
+else
+    echo "FAIL 型号名称规则："; sed 's/^/    /' "${OUT}/keys.txt"; fail=$((fail + 1))
+fi
 
 # ---- run.sh 一键入口：模拟 curl ... | bash（下载地址用 file://，复用上面生成的 h100 场景）
 expect_rc() {   # expect_rc <名称> <期望退出码> <实际退出码> <输出文件> <必须出现的文本>

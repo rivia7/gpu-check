@@ -12,10 +12,12 @@
 curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/main/run.sh | sudo bash
 ```
 
-带参数时接在 `bash -s --` 后面。比如要求必须是 SXM5 版，并把报告另存一份：
+默认按 **H100 SXM5** 核验，也就是国内常说的「NVLink 版」（HGX 8 卡 / 4 卡机型），PCIe 版和 NVL 版会判为「形态不符」。
+
+参数接在 `bash -s --` 后面。比如检测 PCIe 版的 H100 机器，并把报告另存一份：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/main/run.sh | sudo bash -s -- --expect h100-sxm -o /tmp/h100_report.txt
+curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/main/run.sh | sudo bash -s -- --expect h100-pcie -o /tmp/h100_report.txt
 ```
 
 不是 H100 的机器，用 `--expect` 指定期望型号，或用 `--expect any` 只做一致性检查：
@@ -29,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/main/run.sh | sud
 要固定版本、不受仓库后续更新影响，就直接运行打了标签的版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/v1.1.0/h100_check.py | sudo python3 -
+curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/v1.2.0/h100_check.py | sudo python3 -
 ```
 
 ### 服务器访问不了 GitHub 时
@@ -65,8 +67,9 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/v1.1.0/h100_check
 | 参数 | 说明 |
 |---|---|
 | `-o FILE` | 把报告另存一份到文件（不含颜色码） |
-| `--expect h100` | 默认值。H100 的任何形态（SXM5 / PCIe / NVL）都算通过 |
-| `--expect h100-sxm` | 必须是 SXM5 版，PCIe/NVL 版判为「形态不符」。也可用 `h100-pcie`、`h100-nvl`，其它型号同理（如 `a100-sxm`） |
+| `--expect h100-sxm` | 默认值。必须是 H100 SXM5，即「NVLink 版」（HGX 机型），PCIe 版和 NVL 版判为「形态不符」。`h100-nvlink` 是同义写法 |
+| `--expect h100` | H100 的任何形态（SXM5 / PCIe / NVL）都算通过 |
+| `--expect h100-pcie` / `h100-nvl` | 必须是 PCIe 版 / NVL 版。注意 H100 NVL（设备 ID `0x2321`）是用 NVLink 桥连接的 PCIe 双卡，不是上面说的「NVLink 版」。形态后缀对其它型号同样适用（如 `a100-sxm`） |
 | `--expect <型号>` | 期望其它型号，如 `h20`、`a100`、`a800`、`l40s`、`l20`、`4090`、`4090d`、`5090`、`a6000`、`6000ada`。大小写、空格、`rtx` 前缀都可省略 |
 | `--expect any` | 不限型号，只检查各数据源是否一致、规格是否与识别出的型号吻合（比如用来检查 H20 机器本身是否正常） |
 | `--expect-gpus N` | 期望的 GPU 张数。HGX 8 卡机型（4 颗 NVSwitch）会自动按 8 张检查 |
@@ -79,7 +82,7 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/v1.1.0/h100_check
 |---|---|
 | 0 | 通过：GPU 确认为期望的型号，没有健康或配置问题 |
 | 1 | 有告警：GPU 是真的，但有健康/配置问题（NVLink 掉链、IB 端口 down、Xid、ECC、改装显存等）；或真伪暂时无法确认（如驱动未加载） |
-| 2 | 不通过：GPU 不是期望的型号（如期望 H100 实为 H20、期望 4090 实为 4090 D），或发现数据被篡改的证据 |
+| 2 | 不通过：GPU 不是期望的型号（如期望 H100 实为 H20、期望 4090 实为 4090 D）或形态不符（默认期望 SXM5，实为 PCIe 版），或发现数据被篡改的证据 |
 | 3 | 运行错误（非 Linux、找不到 Python、`--expect` 型号无法识别等） |
 
 ## 对线上业务的影响
@@ -121,9 +124,9 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/v1.1.0/h100_check
 
 | 设备 ID | 型号 | 说明 |
 |---|---|---|
-| `0x2330` | H100 SXM5 80GB | HGX H100 8 卡机最常见 |
+| `0x2330` | H100 SXM5 80GB | 即「NVLink 版」，HGX H100 8 卡机最常见；默认按它核验 |
 | `0x2331` | H100 PCIe 80GB | |
-| `0x2321` | H100 NVL 94GB | |
+| `0x2321` | H100 NVL 94GB | 用 NVLink 桥连接的 PCIe 双卡，不是 SXM5 的「NVLink 版」 |
 | `0x2337` / `0x2338` / `0x2339` | H100 SXM5 64GB / 96GB / 94GB | |
 | `0x2329` | **H20 96GB** | 中国特供版，算力大幅阉割 |
 | `0x2328` / `0x232c` | **H20B / H20-3e** | 同上 |
@@ -186,7 +189,7 @@ curl http://127.0.0.1/h100/     # 使用说明、可用版本、最近同步时�
 ```bash
 curl -fsSL http://<中转站>/h100/run.sh | sudo bash                        # 最新版（main）
 curl -fsSL http://<中转站>/h100/run.sh | sudo bash -s -- --expect any      # 带参数
-curl -fsSL http://<中转站>/h100/v1.1.0/run.sh | sudo bash                 # 指定版本
+curl -fsSL http://<中转站>/h100/v1.2.0/run.sh | sudo bash                 # 指定版本
 ```
 
 中转站走 HTTP 明文。链路不可信时，可以拿 `<版本>/SHA256SUMS` 里 `h100_check.py` 的哈希与 GitHub 上的文件比对。
@@ -213,7 +216,8 @@ PYTHON=python3.9 bash tests/run_tests.sh     # 指定解释器
 | `degraded` | 真 H100，但 NVLink 掉链、IB 端口 down、PCIe 降速、FM 未运行、Xid 79、行重映射待处理、ECC 错误 → 通过，有告警 |
 | `nodriver` | 真 H100 硬件，但驱动未加载 → 待确认 |
 | `runfile` | 真 H100，驱动用 .run 覆盖安装在旧版 deb 包之上 → 通过，有告警（不误判为篡改） |
-| `h100pcie` | 8 张 H100 PCIe → 通过；加 `--expect h100-sxm` → 形态不符 |
+| `h100 --expect h100-nvlink` | 同义写法 → 通过 |
+| `h100pcie` | 8 张 H100 PCIe：默认（期望 SXM5）→ 形态不符，并提示加 `--expect h100-pcie`；加 `--expect h100` 或 `h100-pcie` → 通过 |
 | `h20 --expect any` | 只检查一致性 → 通过 |
 | `rtx4090` | 8 张 RTX 4090（取自真实机器）：默认按 H100 核验 → 不通过；`--expect any` / `--expect 4090` → 通过，不报 ECC 关闭、peermem |
 | `rtx4090d --expect 4090` | 诚实的 4090 D 机器 → 不通过（非 RTX 4090） |

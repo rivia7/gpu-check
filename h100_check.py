@@ -14,7 +14,8 @@
 #   * 不修改任何配置（时钟、功耗墙、ECC、MIG、持久模式、Fabric Manager 等一律不碰）；
 #   * 自身以 nice 19 + ionice idle 运行，所有外部命令都有超时，默认不写任何文件。
 #
-# 用法：sudo ./h100_check.py [-o report.txt] [--expect h100-sxm|4090|any ...] [--expect-gpus 8] [--cuda]
+# 用法：sudo ./h100_check.py [-o report.txt] [--expect h100|h100-pcie|4090|any ...] [--expect-gpus 8] [--cuda]
+#       默认 --expect h100-sxm：期望 H100 SXM5（NVLink 版），PCIe 版、NVL 版判“形态不符”
 #       非 root 也能运行，但内存条、整机序列号、网卡料号、内核日志等需要 root 才能读取。
 #
 # 退出码：0=全部通过  1=有告警（健康/配置类）  2=真伪不通过（不是期望的型号，或疑似篡改）  3=运行错误
@@ -36,7 +37,8 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from collections import Counter
 
-VERSION = '1.1.0'
+VERSION = '1.2.0'
+DEFAULT_EXPECT = 'h100-sxm'   # 默认核验 H100 SXM5，即国内常说的“NVLink 版”（HGX 机型）
 
 OK, INFO, WARN, FAIL = 0, 1, 2, 3
 LEVEL_TEXT = {OK: '通过', INFO: '提示', WARN: '警告', FAIL: '不通过'}
@@ -1533,9 +1535,9 @@ def parse_expect(text):
     if t.lower() in ('any', 'all', '*', ''):
         return None
     form = None
-    m = re.match(r'^(.+?)[-_ ]?(sxm\d?|pcie|nvl)$', t, re.I)
-    if m:
-        t, form = m.group(1), {'S': 'SXM', 'P': 'PCIE', 'N': 'NVL'}[m.group(2)[0].upper()]
+    m = re.match(r'^(.+?)[-_ ]?(sxm\d?|nvlink|pcie|nvl)$', t, re.I)
+    if m:      # nvlink = sxm：国内说的“NVLink 版”就是 SXM 模组（HGX 机型）；H100 NVL 是带 NVLink 桥的 PCIe 卡
+        t, form = m.group(1), {'NVLINK': 'SXM', 'PCIE': 'PCIE', 'NVL': 'NVL'}.get(m.group(2).upper(), 'SXM')
     key = model_key(t) or model_key('RTX ' + t)
     if not key or key not in KNOWN_KEYS:
         return False
@@ -1557,7 +1559,12 @@ def expect_check(db, exp):
     keys = db_keys(db)
     if exp['key'] in keys:
         if exp['form'] and not db['form'].upper().startswith(exp['form']):
-            return FAIL, '实为 %s，与期望的 %s 版不符' % (sku, exp['label'])
+            if db['form'] == '?':
+                return WARN, '无法从设备 ID 确定 %s 的形态（SXM / PCIe / NVL），未能确认是否为 %s 版' % (sku, exp['label'])
+            sfx = {'P': 'pcie', 'N': 'nvl', 'S': 'sxm'}.get(db['form'][:1].upper())
+            hint = ('（如果采购的就是 %s 版，请加 --expect %s-%s）' % (db['form'], exp['fam'].lower().replace(' ', ''), sfx)
+                    if sfx else '')
+            return FAIL, '实为 %s，与期望的 %s 版不符%s' % (sku, exp['label'], hint)
         return OK, '硬件识别为 %s%s' % (sku, via)
     if exp['key'] == 'H100':
         if db['family'] == 'GH100?':
@@ -2054,9 +2061,13 @@ def render(ctx, args, elapsed):
     rep.add('  模式: 只读（不创建 CUDA 上下文 / 不占显存 / 不跑负载 / 不改任何配置），nice 19 + ionice idle'
             + ('；已启用 --cuda 设备属性查询（无上下文）' if args.cuda else ''))
     exp = args.exp
-    rep.add('  核验目标: %s（--expect %s）' % (
-        '不限型号，只检查各数据源是否一致、规格是否与识别出的型号吻合' if exp is None else
-        exp['label'] + ('，任意形态均可' if not exp['form'] and exp['key'] == 'H100' else ''), args.expect))
+    if exp is None:
+        goal = '不限型号，只检查各数据源是否一致、规格是否与识别出的型号吻合'
+    elif exp['form']:
+        goal = exp['label'] + (' / NVLink 版' if exp['form'] == 'SXM' else ' 版')
+    else:
+        goal = exp['label'] + ('，任意形态均可' if exp['key'] == 'H100' else '')
+    rep.add('  核验目标: %s（--expect %s%s）' % (goal, args.expect, '，默认值' if args.expect == DEFAULT_EXPECT else ''))
     if not G.is_root:
         rep.add('  ' + yellow('提示: 非 root 运行，内存条、整机序列号、网卡料号、内核日志等信息可能缺失'))
 
@@ -2510,8 +2521,15 @@ def render_conclusion(rep, ctx):
         if not gpus:
             rep.add(red('  总体结论：[不通过] 未发现任何 NVIDIA GPU。'))
         elif bad:
-            rep.add(red('  总体结论：[不通过] %d 张 GPU 真伪核验不通过（%s），详见第四节。'
-                        % (len(bad), '；'.join('%s %d 张' % kv for kv in Counter(g['verdict'][1] for g in bad).items()))))
+            cnt = '；'.join('%s %d 张' % kv for kv in Counter(g['verdict'][1] for g in bad).items())
+            if all(g['verdict'][1].startswith('形态不符') for g in bad):
+                hints = [re.search(r'（(如果采购的就是[^）]*)）', c['detail']) for g in bad for c in g['checks']
+                         if c['key'] == 'hwid']
+                hint = next((m.group(1) for m in hints if m), '')
+                rep.add(red('  总体结论：[不通过] %d 张 GPU 的形态与期望不符（%s）%s，详见第四节。'
+                            % (len(bad), cnt, '；' + hint if hint else '')))
+            else:
+                rep.add(red('  总体结论：[不通过] %d 张 GPU 真伪核验不通过（%s），详见第四节。' % (len(bad), cnt)))
         else:
             rep.add(red('  总体结论：[不通过] 工具链疑似被篡改，GPU 信息不可信，详见第四节。'))
     elif auth == WARN:
@@ -2626,9 +2644,10 @@ def parse_args():
                     '不影响线上业务）。',
         epilog='退出码：0=通过 1=有告警 2=真伪不通过（不是期望的型号，或疑似篡改） 3=运行错误')
     ap.add_argument('-o', '--output', metavar='FILE', help='同时把报告（无颜色）保存到文件')
-    ap.add_argument('--expect', default='h100', metavar='型号',
-                    help='期望的 GPU 型号，默认 h100（任意 H100 形态均可）。可加形态后缀 -sxm/-pcie/-nvl，如 h100-sxm、'
-                         'a100-sxm；也可以是其它型号，如 h20、a800、l40s、l20、4090、4090d、5090、a6000、6000ada；'
+    ap.add_argument('--expect', default=DEFAULT_EXPECT, metavar='型号',
+                    help='期望的 GPU 型号，默认 h100-sxm：H100 SXM5，即 NVLink 版（HGX 机型），PCIe 版、NVL 版判“形态不符”。'
+                         'h100 表示任意 H100 形态均可；也可用 h100-pcie、h100-nvl。形态后缀 -sxm（同义 -nvlink）/-pcie/-nvl '
+                         '适用于各型号，如 a100-sxm；其它型号如 h20、a800、l40s、l20、4090、4090d、5090、a6000、6000ada；'
                          'any 表示不限型号，只做一致性检查')
     ap.add_argument('--expect-gpus', type=int, metavar='N', help='期望的 GPU 数量（HGX 8 卡机型默认按 8 检查）')
     ap.add_argument('--cuda', action='store_true',

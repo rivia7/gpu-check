@@ -41,7 +41,9 @@ check() {   # check <场景> <期望退出码> <报告中必须出现的文本>.
 }
 
 check h100 0 '总体结论：[通过]' '8/8 张 GPU 确认为 H100 SXM5 80GB' '真 H100 SXM5' 'SW0:5 SW1:4 SW2:4 SW3:5' \
-    'MCX75310AAS-NEAT' 'mlx5_0(PIX)' 'M321R8GA0BB0-CQKZJ' 'NVML 直连交叉验证'
+    'MCX75310AAS-NEAT' 'mlx5_0(PIX)' 'M321R8GA0BB0-CQKZJ' 'NVML 直连交叉验证' \
+    '核验目标: H100 SXM5 / NVLink 版（--expect h100-sxm，默认值）' '四、H100 SXM5 真伪核验'
+ARGS='--expect h100-nvlink' check h100 0 '核验目标: H100 SXM5 / NVLink 版（--expect h100-nvlink）'
 check h20-fake 2 '实为 H20 96GB，不是 H100' 'nvidia-smi 报告“NVIDIA H100 80GB HBM3”' '文件在安装后被修改' \
     'nvidia-smi 上报设备 ID 0x2330' '总体结论：[不通过]'
 check h20 2 '实为 H20 96GB，不是 H100' '非H100: H20' '总体结论：[不通过]'
@@ -50,11 +52,14 @@ check degraded 1 '链路 17 未激活' 'mlx5_4/1 端口状态 DOWN' 'nvidia-fabr
     '待生效的行重映射' 'PCIe 降级' '硬件降频' '不可纠正 ECC' '[通过，有告警]'
 check nodriver 1 '待确认' '只完成了硬件 ID 核验' '未绑定任何驱动' '未找到 nvidia-smi'
 check runfile 1 '多半是用 .run 安装包覆盖' '8 张 GPU 确认为真 H100 SXM5 80GB' '[通过，有告警]'
-check h100pcie 0 '真 H100 PCIe' '8 张 GPU 确认为真 H100 PCIe 80GB' '本机 GPU 无 NVLink'
-ARGS='--expect h100-sxm' check h100pcie 2 '实为 H100 PCIe 80GB，与期望的 H100 SXM5 版不符' '形态不符: H100 PCIe'
+# 默认期望 SXM5（NVLink 版）：PCIe 版判形态不符，并提示改用 --expect h100-pcie
+check h100pcie 2 '实为 H100 PCIe 80GB，与期望的 H100 SXM5 版不符' '形态不符: H100 PCIe' \
+    '总体结论：[不通过] 8 张 GPU 的形态与期望不符（形态不符: H100 PCIe 8 张）；如果采购的就是 PCIe 版，请加 --expect h100-pcie'
+ARGS='--expect h100' check h100pcie 0 '真 H100 PCIe' '8 张 GPU 确认为真 H100 PCIe 80GB' '本机 GPU 无 NVLink'
+ARGS='--expect h100-pcie' check h100pcie 0 '核验目标: H100 PCIe 版（--expect h100-pcie）'
 ARGS='--expect any' check h20 0 '8 张 GPU 确认为真 H20 96GB'
 # 消费级显卡：默认按 H100 核验 → 不通过；--expect any / 4090 → 通过，且不报 GeForce 无关的 ECC、peermem 提示
-check rtx4090 2 '实为 RTX 4090，不是 H100' '非H100: RTX 4090' '四、H100 真伪核验'
+check rtx4090 2 '实为 RTX 4090，不是 H100' '非H100: RTX 4090' '四、H100 SXM5 真伪核验'
 ARGS='--expect any' check rtx4090 0 '8/8 张 GPU 确认为 RTX 4090' '真 RTX 4090' '| 128 ' '| 0%' '四、GPU 型号与真伪核验' \
     '!ECC 已关闭' '!nvidia_peermem' '!0.0%' '!待确认'
 ARGS='--expect 4090' check rtx4090 0 '四、RTX 4090 真伪核验' '核验目标: RTX 4090'

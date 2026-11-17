@@ -2,7 +2,7 @@
 # h100_check 一键运行入口（只读检测，不影响线上业务）
 #
 #   curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/main/run.sh | sudo bash
-#   curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/main/run.sh | sudo bash -s -- --expect h100-sxm -o /tmp/h100_report.txt
+#   curl -fsSL https://raw.githubusercontent.com/rivia7/h100-check/main/run.sh | sudo bash -s -- --expect h100-pcie -o /tmp/h100_report.txt
 #
 # 只做三件事：找到 Python 3.6+ → 把 h100_check.py 下载到内存并检查是否完整 → 交给 Python 从标准输入执行。
 # 除了 -o 指定的报告文件，不在磁盘上写任何东西。

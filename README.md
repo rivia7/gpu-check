@@ -2,9 +2,9 @@
 
 单文件脚本 `gpu_check.py`，只用 Python 3.6+ 标准库，不需要 pip 安装任何东西。在 GPU 服务器上运行，它会：
 
-- **收集硬件配置**：整机、CPU、内存、存储、GPU、NVLink 拓扑、IB / RDMA 网卡，在终端输出表格报告；
+- **收集硬件配置**：整机、CPU、内存、存储、GPU、GPU 互联拓扑（NVLink / PCIe）、IB / RDMA 网卡，在终端输出表格报告；
 - **核验 GPU 真伪**：按芯片熔丝决定的设备 ID 识别型号，再与驱动、NVML、nvidia-smi 报告的名称和规格交叉比对。能识别 H20 / H800 冒充 H100、RTX 4090 D 冒充 4090、RTX PRO 6000D 冒充 RTX PRO 6000、矿卡冒充计算卡，以及 nvidia-smi 被篡改等情况；
-- **检查健康状况**：NVLink 掉链、IB 端口、PCIe 降速、Xid、ECC、行重映射等。
+- **检查健康状况**：NVLink 掉链、IB 端口、PCIe 降速、Xid、ECC、行重映射等。网卡的 PCIe 链路低于最高规格、但带宽仍够所有网口满速时（如 OCP 插槽只接了 x8 的 25G 网卡），只提示不告警。
 
 型号库覆盖 Pascal 到 Blackwell 的 235 个设备 ID，包括数据中心卡、专业卡、GeForce 和矿卡，见「支持的型号」。
 
@@ -41,7 +41,7 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/gpu-check/main/run.sh | sudo
 要固定版本、不受仓库后续更新影响，就直接运行打了标签的版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rivia7/gpu-check/v1.4.1/gpu_check.py | sudo python3 -
+curl -fsSL https://raw.githubusercontent.com/rivia7/gpu-check/v1.4.2/gpu_check.py | sudo python3 -
 ```
 
 ### 服务器访问不了 GitHub 时
@@ -113,7 +113,7 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/gpu-check/v1.4.1/gpu_check.p
 2. **CPU / 内存 / 存储**：CPU 型号与路数、NUMA、内存条型号/速率/槽位、NVMe 盘
 3. **GPU 清单**：型号、显存、功耗墙、最大频率、PCIe 最高规格、NUMA、VBIOS、序列号、模组 ID、板卡料号、InfoROM、UUID、持久模式/MIG/ECC
 4. **真伪核验**：每张卡逐项比对设备 ID 和规格，另有驱动软件完整性检查（见下节）
-5. **NVLink 拓扑**：`nvidia-smi topo -m` 互联矩阵（含每张 GPU 就近的 CPU 核和 NUMA 节点）、每卡链路激活数/速率/错误计数/未激活链路、通过 NVML 读到的各卡到每颗 NVSwitch 的链路分布、NVSwitch 数量、Fabric Manager 状态
+5. **GPU 互联拓扑**：`nvidia-smi topo -m` 互联矩阵（含每张 GPU 就近的 CPU 核和 NUMA 节点）、每卡链路激活数/速率/错误计数/未激活链路、通过 NVML 读到的各卡到每颗 NVSwitch 的链路分布、NVSwitch 数量、Fabric Manager 状态
 6. **IB / RDMA 网卡**：型号、料号(PN)、序列号、固件、PSID、PCIe 当前/最高速率、端口状态/速率/LID、链路错误计数，以及每张 GPU 最近的 RDMA 网卡（用于 GPUDirect RDMA）
 7. **其它网卡**：管理网卡等
 8. **GPU 运行状态快照**：温度、功耗、利用率、显存占用、进程数、ECC、行重映射、降频原因、Xid
@@ -246,7 +246,7 @@ curl http://127.0.0.1/gpu/      # 使用说明、可用版本、最近同步时�
 ```bash
 curl -fsSL http://<中转站>/gpu/run.sh | sudo bash                        # 最新版（main）
 curl -fsSL http://<中转站>/gpu/run.sh | sudo bash -s -- --expect any      # 带参数
-curl -fsSL http://<中转站>/gpu/v1.4.1/run.sh | sudo bash                 # 指定版本
+curl -fsSL http://<中转站>/gpu/v1.4.2/run.sh | sudo bash                 # 指定版本
 ```
 
 中转站走 HTTP 明文。链路不可信时，可以拿 `<版本>/SHA256SUMS` 里 `gpu_check.py` 的哈希与 GitHub 上的文件比对。
@@ -281,7 +281,7 @@ PYTHON=python3.9 bash tests/run_tests.sh     # 指定解释器
 | `rtx4090d-fake --expect 4090` | 硬件是 4090 D，nvidia-smi 被篡改成显示 4090 → 不通过 |
 | `rtx4090-48g --expect 4090` | 改装 48GB 显存的 4090 → 通过，有告警（改装大显存） |
 | `pciids --expect any` | 设备 ID 不在型号库里，按本机 pci.ids 识别 → 通过，并注明识别来源 |
-| `rtx6000d` | 8 张 RTX PRO 6000D 服务器版（取自真实机器，驱动名「RTX 6000D」）：`--expect pro6000d` / `6000d` → 通过；`--expect pro6000` → 不通过（特供版冒充 RTX PRO 6000）；默认 → 不通过（非 H100） |
+| `rtx6000d` | 8 张 RTX PRO 6000D 服务器版（取自真实机器，驱动名「RTX 6000D」）：`--expect pro6000d` / `6000d` → 通过（这台机器的 25G 网卡只跑到 PCIe x8，带宽够用，只提示；RAID 虚拟盘、BMC 的 USB 网口也要显示正确）；`--expect pro6000` → 不通过（特供版冒充 RTX PRO 6000）；默认 → 不通过（非 H100） |
 | `unknownid` | 设备 ID 型号库和 pci.ids 都不认识：默认 → 驱动名称是别的型号，不通过；`--expect 6000d` → 名称相符，待确认 |
 | `cmp170hx` | 8 张 CMP 170HX 矿卡（GA100 核心）：`--expect a100` → 不通过，注明是挖矿专用卡；`--expect any` → 通过，识别为 CMP 170HX（70 个 SM） |
 

@@ -42,7 +42,9 @@ check() {   # check <场景> <期望退出码> <报告中必须出现的文本>.
 
 check h100 0 '总体结论：[通过]' '8/8 张 GPU 确认为 H100 SXM5 80GB' '真 H100 SXM5' 'SW0:5 SW1:4 SW2:4 SW3:5' \
     'MCX75310AAS-NEAT' 'mlx5_0(PIX)' 'M321R8GA0BB0-CQKZJ' 'NVML 交叉核对' \
-    '核验目标: H100 SXM5，即 NVLink 版（--expect h100-sxm，默认值）' '四、H100 SXM5 真伪核验'
+    '核验目标: H100 SXM5，即 NVLink 版（--expect h100-sxm，默认值）' '四、H100 SXM5 真伪核验' \
+    '五、GPU 互联拓扑' 'NV18 = 通过 18 条 NVLink 互联（经过 NVSwitch）' '!PIX = 最多经过一个 PCIe 桥' \
+    '模组 ID 是 GPU 在 HGX 主板上的编号' 'OE：树外编译、未签名，NVIDIA 驱动一般都是这样'
 ARGS='--expect h100-nvlink' check h100 0 '核验目标: H100 SXM5，即 NVLink 版（--expect h100-nvlink）'
 check h20-fake 2 '实为 H20 96GB，不是 H100' 'nvidia-smi 报告的型号是“NVIDIA H100 80GB HBM3”' '文件在安装后被修改' \
     'nvidia-smi 报告的设备 ID 是 0x2330' '总体结论：[不通过]' '!本次按默认目标'
@@ -50,13 +52,14 @@ check h20 2 '实为 H20 96GB，不是 H100' '非 H100，实为 H20' '总体结�
     '提示：本次按默认目标 H100 SXM5 核验。如果这台机器本来就是 H20 96GB，请加 --expect h20 重新检测'
 check h800 2 '实为 H800 SXM5 80GB，不是 H100' '非 H100，实为 H800 SXM5' '| 8/8 ' 'NV8'
 check degraded 1 '链路 17 未激活' 'mlx5_4/1 端口状态 DOWN' 'nvidia-fabricmanager 未运行' 'Xid 79（GPU 掉卡' \
-    '待生效的行重映射' 'PCIe 降级' '硬件降频' '不可纠正 ECC' '[通过，有告警]'
+    '待生效的行重映射' 'PCIe 降级' '硬件降频' '不可纠正 ECC' '[通过，有告警]' \
+    '带宽只有约 252 Gb/s，不够网口满速使用（共 400 Gb/s）'
 check nodriver 1 '待确认' '只核对了设备 ID' '未绑定任何驱动' '未找到 nvidia-smi' '错误码 9，驱动未加载'
 check runfile 1 '多半是用 .run 安装包覆盖' '8 张 GPU 确认为真 H100 SXM5 80GB' '[通过，有告警]'
 # 默认期望 SXM5（NVLink 版）：PCIe 版判形态不符，并提示改用 --expect h100-pcie
 check h100pcie 2 '实为 H100 PCIe 80GB，与期望的 H100 SXM5 版不符' '形态不符，实为 H100 PCIe' \
     '总体结论：[不通过] 8 张 GPU 实为 H100 PCIe 80GB，与期望的 H100 SXM5 版不符；如果采购的就是 PCIe 版，请加 --expect h100-pcie'
-ARGS='--expect h100' check h100pcie 0 '真 H100 PCIe' '8 张 GPU 确认为真 H100 PCIe 80GB' '本机 GPU 无 NVLink'
+ARGS='--expect h100' check h100pcie 0 '真 H100 PCIe' '8 张 GPU 确认为真 H100 PCIe 80GB' '本机 GPU 之间没有 NVLink'
 ARGS='--expect h100-pcie' check h100pcie 0 '核验目标: H100 PCIe 版（--expect h100-pcie）'
 ARGS='--expect any' check h20 0 '8 张 GPU 确认为真 H20 96GB'
 # 消费级显卡：默认按 H100 核验 → 不通过，并提示加 --expect 4090；--expect any / 4090 → 通过，且不报 GeForce 无关的 ECC、peermem 提示
@@ -70,7 +73,10 @@ ARGS='--expect 4090' check rtx4090d-fake 2 '实为 RTX 4090 D，不是 RTX 4090'
 ARGS='--expect 4090' check rtx4090-48g 1 '疑似改装大显存' '真 RTX 4090（改装 48GB 显存）' '[通过，有告警]'
 ARGS='--expect any' check pciids 0 '按本机 pci.ids 识别' '真 GeForce RTX 4090'
 # RTX PRO 6000D：驱动名“NVIDIA RTX 6000D”要认作 RTX PRO 6000D；冒充 RTX PRO 6000 时判不通过
-ARGS='--expect pro6000d' check rtx6000d 0 '总体结论：[通过]' '真 RTX PRO 6000D Blackwell Server' '| 156 ' '| 448 ' '| 一致 '
+# 这台真机还有：OCP 插槽只接了 x8 的 25G 双口网卡（带宽够用，只提示）、RAID 卡上的虚拟盘、BMC 的 USB 虚拟网口
+ARGS='--expect pro6000d' check rtx6000d 0 '总体结论：[通过]' '真 RTX PRO 6000D Blackwell Server' '| 156 ' '| 448 ' '| 一致 ' \
+    'mlx5_bond_0（ConnectX-5）PCIe 链路低于最高规格，但带宽够用，可以忽略' '够所有网口满速使用（共 50 Gb/s）' '!PCIe 降级运行' \
+    'RAID 卷' 'USB 网卡（通常是 BMC 的虚拟网口）' '| 不涉及 ' '!模组 ID 是 GPU 在 HGX 主板上的编号'
 ARGS='--expect 6000d' check rtx6000d 0 '核验目标: RTX PRO 6000D（--expect 6000d）'
 ARGS='--expect pro6000' check rtx6000d 2 '实为 RTX PRO 6000D Blackwell Server，不是 RTX PRO 6000 —— 面向中国市场的特供版' \
     '非 RTX PRO 6000，实为 RTX PRO 6000D Blackwell Server'

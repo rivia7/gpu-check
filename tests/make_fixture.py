@@ -19,7 +19,8 @@
   rtx4090d-fake  硬件是 RTX 4090 D，nvidia-smi 被篡改成显示 RTX 4090
   rtx4090-48g    改装成 48GB 显存的 RTX 4090（魔改卡）
   pciids         设备 ID 不在内置型号库里（虚构的 0x26ff），只能靠本机 pci.ids（lspci）识别
-  rtx6000d       8 张 RTX PRO 6000D 服务器版（0x2bb9，驱动名“NVIDIA RTX 6000D”；数值取自一台真实机器的报告）
+  rtx6000d       8 张 RTX PRO 6000D 服务器版（0x2bb9，驱动名“NVIDIA RTX 6000D”；数值取自一台真实机器的报告，
+                 含只接了 x8 的 25G 网卡、RAID 虚拟盘、BMC 的 USB 网口）
   unknownid      驱动名同上，但设备 ID 型号库和 pci.ids 都不认识（虚构的 0x2bfe）
   cmp170hx       8 张 CMP 170HX 矿卡（GA100 核心，常被冒充成 A100）
 注意：H20/H800 的功耗、SM 数等数值只是测试占位，不代表真实规格。
@@ -371,6 +372,36 @@ def build(scenario, out):
         wr(nb + '/mtu', '1500\n')
         wr(nb + '/speed', ('1000' if j == 0 else '-1') + '\n')
         wr(nb + '/type', '1\n')
+    if scenario == 'rtx6000d':
+        # 取自真实机器：OCP 3.0 插槽只接了 x8 的 25G 双口网卡（两个口做了 RoCE bond），以及 BMC 的 USB 虚拟网口
+        cx5 = make_vpd('ConnectX-5 EN network interface card for OCP 3.0, with host management, 25GbE Dual-port SFP28, '
+                       'Pull Tab bracket', 'MCX562A-ACAB', 'MT2217K12635')
+        for f in (0, 1):
+            bdf = '0000:b8:00.%d' % f
+            base = pci_dev(root, bdf, 0x15b3, 0x1017, 0x020000, 0x15b3, 0x0020, 1, '8.0 GT/s PCIe', 8,
+                           '8.0 GT/s PCIe', 16, driver='mlx5_core', vpd=cx5 if f == 0 else None)
+            ifname = 'ens31f%dnp%d' % (f, f)
+            os.makedirs(base + '/net/' + ifname)
+            nb = root + '/sys/class/net/' + ifname
+            ln(nb + '/device', '../../../bus/pci/devices/' + bdf)
+            for k, v in (('operstate', 'up'), ('mtu', '1500'), ('speed', '25000'), ('type', '1')):
+                wr(nb + '/' + k, v + '\n')
+        ib_base = root + '/sys/class/infiniband/mlx5_bond_0'
+        ln(ib_base + '/device', '../../../bus/pci/devices/0000:b8:00.0')
+        for k, v in (('fw_ver', '16.32.1010'), ('hca_type', 'MT4119'), ('board_id', 'MT_0000000241'),
+                     ('node_guid', 'b8ce:f603:00a1:b2c3'), ('node_type', '1: CA')):
+            wr(ib_base + '/' + k, v + '\n')
+        for k, v in (('state', '4: ACTIVE'), ('phys_state', '5: LinkUp'), ('rate', '25 Gb/sec (1X EDR)'),
+                     ('link_layer', 'Ethernet'), ('lid', '0x0'), ('sm_lid', '0x0')):
+            wr(ib_base + '/ports/1/' + k, v + '\n')
+        for cn in ('symbol_error', 'port_rcv_errors', 'link_downed'):
+            wr(ib_base + '/ports/1/counters/' + cn, '0\n')
+        os.makedirs(root + '/sys/bus/usb/drivers/cdc_ether')
+        ln(root + '/sys/bus/usb/devices/1-11.3:2.0/driver', '../../drivers/cdc_ether')
+        nb = root + '/sys/class/net/enx46e957d8d2d6'
+        ln(nb + '/device', '../../../bus/usb/devices/1-11.3:2.0')
+        for k, v in (('operstate', 'down'), ('mtu', '1500'), ('speed', '-1'), ('type', '1')):
+            wr(nb + '/' + k, v + '\n')
     os.makedirs(root + '/sys/class/net/lo')
     wr(root + '/sys/class/net/lo/operstate', 'unknown\n')
 
@@ -421,6 +452,8 @@ def build(scenario, out):
              % k for k in range(8)]
     disks.append('NAME="nvme8n1" MODEL="SAMSUNG MZ1L2960HCJR-00A07" SIZE="960197124096" TYPE="disk" TRAN="nvme" ROTA="0"')
     disks.append('NAME="loop0" MODEL="" SIZE="67108864" TYPE="loop" TRAN="" ROTA="0"')
+    if scenario == 'rtx6000d':      # 取自真实机器：RAID 卡上的虚拟盘，lsblk 报 ROTA=1
+        disks.append('NAME="sda" MODEL="MR9364-8i" SIZE="959656755200" TYPE="disk" TRAN="" ROTA="1"')
     wr(data + '/lsblk.txt', '\n'.join(disks) + '\n')
     lspci = ['%s "Ethernet controller [0200]" "Intel Corporation [8086]" "I350 Gigabit Network Connection [1521]" '
              '-r01 "Super Micro Computer Inc [15d9]" "Device [1521]"' % b for b in MGMT_BDFS]

@@ -39,7 +39,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from collections import Counter
 
-VERSION = '1.4.1'
+VERSION = '1.4.2'
 DEFAULT_EXPECT = 'h100-sxm'   # 默认核验 H100 SXM5，即国内常说的“NVLink 版”（HGX 机型）
 
 OK, INFO, WARN, FAIL = 0, 1, 2, 3
@@ -564,6 +564,35 @@ def fmt_link(speed, width):
     return 'Gen%s x%s' % (gen if gen else '?', w if w else '?')
 
 
+PCIE_LANE_GBPS = {1: 2.0, 2: 4.0, 3: 7.877, 4: 15.754, 5: 31.508, 6: 60.5}   # 每条 lane 的单向有效速率，已扣除编码开销
+
+
+def pcie_gbps(gen, width):
+    """PCIe 链路的单向带宽（Gb/s），算不出来时返回 None"""
+    m = re.search(r'\d+', str(width or ''))
+    return PCIE_LANE_GBPS[gen] * int(m.group()) if (gen in PCIE_LANE_GBPS and m) else None
+
+
+def nic_port_gbps(bdf, hcas, nics):
+    """一块网卡所有网口的速率之和（Gb/s）。同一个 PCI 设备下的各个 function 共用一条 PCIe 链路，要合在一起算；
+    有网口没连上、速率未知时返回 None，这时判断不了 PCIe 带宽够不够"""
+    dev = bdf.rsplit('.', 1)[0] if bdf else None
+    total = 0.0
+    for h in hcas:
+        if dev and h['bdf'] and h['bdf'].rsplit('.', 1)[0] == dev:
+            for pt in h['ports']:
+                m = re.match(r'\s*([\d.]+)\s*Gb', pt['rate'] or '')
+                if pt['state'] != 'ACTIVE' or not m:
+                    return None
+                total += float(m.group(1))
+    for n in nics:
+        if dev and n['bdf'] and n['bdf'].rsplit('.', 1)[0] == dev:
+            if not n['speed']:
+                return None
+            total += n['speed'] / 1000.0
+    return total or None
+
+
 def compress_ids(ids):
     ids = sorted(set(i for i in ids if i is not None))
     out, i = [], 0
@@ -829,6 +858,10 @@ def collect_memory():
             why = (err or out or '').strip().splitlines()
             mem['dimm_note'] = 'dmidecode 没有读到内存条信息%s' % ('：' + clip(why[0], 60) if why else '')
     return mem
+
+
+# 硬件 RAID 卡上建的虚拟盘：lsblk 显示的“型号”是 RAID 卡的型号，ROTA 也不可靠（不少 RAID 卡一律报 1，显示成 HDD）
+RAID_VD = re.compile(r'MR\d{4}|PERC |LOGICAL VOLUME|ServeRAID|MegaRAID|RAID \d|AVAGO|SMC\d{4}|HW-SAS', re.I)
 
 
 def collect_storage():
@@ -2012,7 +2045,7 @@ def evaluate(ctx, args):
         vers['NVML'] = nv['driver']
     m = re.search(r'\.so\.(\d+\.\d+(?:\.\d+)?)$', os.path.realpath(nv['lib'])) if nv.get('lib') else None
     if m:
-        vers['libnvidia-ml'] = m.group(1)
+        vers['NVML 库文件'] = m.group(1)
     ctx['versions'] = vers
     kv_ = vers.get('内核模块')
     forged = [k for k in ('nvidia-smi', 'NVML') if kv_ and vers.get(k) and vers[k] != kv_]
@@ -2060,6 +2093,9 @@ def evaluate(ctx, args):
 
     # ---------------- NVLink / NVSwitch / Fabric Manager
     fm = ctx['fm']
+    # 本来就没有 NVLink 的机器（PCIe 卡、没装 NVLink 桥）：报告里 NVLink 一项显示“不涉及”
+    ctx['no_nvlink'] = bool(gpus) and not nvsw and not any(g.get('nvl') for g in gpus) and \
+        not any(g['db'] and g['db'].get('links') for g in gpus)
     if nvsw and sxm:
         if fm.get('active') != 'active':
             F('NVLink', WARN, '本机有 NVSwitch，但 nvidia-fabricmanager 未运行（状态：%s），GPU 之间的 NVLink 通信和 CUDA '
@@ -2117,8 +2153,16 @@ def evaluate(ctx, args):
                   % (name, c.get('link_downed', 0), c.get('symbol_error', 0), c.get('port_rcv_errors', 0)))
         if h['cur_gen'] and h['max_gen'] and (h['cur_gen'] < h['max_gen'] or
                                               (h['cur_w'] and h['max_w'] and h['cur_w'] != h['max_w'])):
-            F('PCIe', WARN, '%s（%s）PCIe 降级运行：当前 %s，最高支持 %s'
-              % (h['dev'], h['model'], h['link'], h['link_max']))
+            # 链路低于网卡最高规格，但带宽够所有网口满速用时（如 OCP 插槽只接了 x8 的 25G 网卡），只提示不告警
+            have, need = pcie_gbps(h['cur_gen'], h['cur_w']), nic_port_gbps(h['bdf'], hcas, ctx['eth'][0])
+            if have and need and have >= need:
+                F('PCIe', INFO, '%s（%s）PCIe 链路低于最高规格，但带宽够用，可以忽略：当前 %s，最高支持 %s；'
+                  '带宽约 %d Gb/s，够所有网口满速使用（共 %d Gb/s），多半是插槽本身只支持到这个规格'
+                  % (h['dev'], h['model'], h['link'], h['link_max'], have, need))
+            else:
+                F('PCIe', WARN, '%s（%s）PCIe 降级运行：当前 %s，最高支持 %s%s'
+                  % (h['dev'], h['model'], h['link'], h['link_max'],
+                     '；带宽只有约 %d Gb/s，不够网口满速使用（共 %d Gb/s）' % (have, need) if (have and need) else ''))
     if len(rates) > 1:
         F('IB/RDMA', WARN, 'IB 端口速率不一致：%s' % '，'.join('%s x%d' % kv for kv in rates.most_common()))
     pro = [g for g in gpus if not (g['db'] and g['db']['tier'] == 'gf')]    # GeForce 不支持 GPUDirect RDMA
@@ -2317,7 +2361,7 @@ def render_hw(rep, ctx):
                     else '%.0f GB' % (int(d.get('SIZE', '0')) / 1e9)
             except ValueError:
                 size = d.get('SIZE', '-')
-            kind = 'HDD' if d.get('ROTA') == '1' else 'SSD'
+            kind = 'RAID 卷' if RAID_VD.search(d.get('MODEL', '')) else ('HDD' if d.get('ROTA') == '1' else 'SSD')
             grp[(d.get('MODEL', '').strip() or '-', size, (d.get('TRAN') or '-').upper(), kind)] += 1
         names = {}
         for d in disks:
@@ -2344,9 +2388,11 @@ def render_gpu_list(rep, ctx):
             if d.get('power_max') else '-'
         clk = '%s/%s' % (iv(d.get('max_sm')), iv(d.get('max_mem'))) \
             if d.get('max_sm') else '-'
+        # 模组 ID 只对 HGX 这类主板上的 GPU 有意义，PCIe 卡一律是 1，显示成“-”
+        pcie_card = g['db'] and g['db']['form'].upper().startswith(('PCIE', 'NVL'))
         rows.append([s(g['idx']), short_bdf(g['bdf']), clip(name, 26), mem, pw, clk,
                      fmt_link(p.get('max_speed'), p.get('max_width')), s(p.get('numa') if p.get('numa', -1) >= 0 else None),
-                     s(d.get('vbios')), s(d.get('serial')), s(d.get('module_id')),
+                     s(d.get('vbios')), s(d.get('serial')), '-' if pcie_card else s(d.get('module_id')),
                      s(p.get('driver'), red('无驱动') if p else '-')])
     rep.table(['GPU', 'PCI 地址', '型号(nvidia-smi)', '显存', '功耗墙 当前/最大', '最大频率 SM/显存(MHz)', 'PCIe 最高规格',
                'NUMA', 'VBIOS', '序列号', '模组 ID', '内核驱动'], rows, aligns='r')
@@ -2357,7 +2403,9 @@ def render_gpu_list(rep, ctx):
                      s(d.get('persistence')), s(d.get('mig')), s(d.get('ecc'))])
     if any(g['smi'] for g in gpus):
         rep.table(['GPU', '板卡料号', 'GPU 部件号', 'InfoROM', 'UUID', '持久模式', 'MIG', 'ECC'], rows, aligns='r')
-    rep.note('序列号、模组 ID 可以和 GPU 模组上的标签、供应商的装箱单逐一核对。')
+    sxm = any(g['db'] and g['db']['form'].startswith('SXM') for g in gpus)
+    rep.note('序列号可以和 GPU 上贴的标签、供应商的装箱单逐一核对'
+             + ('；模组 ID 是 GPU 在 HGX 主板上的编号，排查故障时可以用来定位是哪一块 GPU。' if sxm else '。'))
 
 
 def render_authenticity(rep, ctx, args):
@@ -2439,8 +2487,11 @@ def render_authenticity(rep, ctx, args):
     rows.append(['各来源的 GPU 数量', lv_cell(lvl, LEVEL_TEXT[lvl]), '，'.join('%s=%d' % kv for kv in cnt)])
     if drv.get('kmod_line'):
         rows.append(['内核模块', '-', clip(drv['kmod_line'], 90)])
-        rows.append(['模块 srcversion', '-', '%s（taint=%s；可以和装了同版本驱动的正常机器比对）'
-                     % (s(drv.get('srcversion')), s(drv.get('taint')))])
+        rows.append(['模块 srcversion', '-', '%s（可以和装了同版本驱动的正常机器比对）' % s(drv.get('srcversion'))])
+        t = (drv.get('taint') or '').strip()
+        if t:
+            rows.append(['模块 taint 标志', '-', '%s：%s%s' % (t, '、'.join(TAINT_CN.get(c, c) for c in t),
+                                                      '，NVIDIA 驱动一般都是这样' if set(t) <= set('POE') else '，请确认原因')])
     rep.table(['检查项', '结果', '说明'], rows)
     rep.note('判定方法（全程只读，几个数据源互相印证）：\n'
              '  1) 设备 ID：由 GPU 芯片熔丝决定，改名字、贴标签、改 nvidia-smi 都改不了，是识别型号的主要依据；\n'
@@ -2455,9 +2506,18 @@ def render_authenticity(rep, ctx, args):
              '  局限：防不住内核级伪造（改内核或 PCI 层）；要实测算力，需要在维护窗口对空闲 GPU 单独压测。')
 
 
+TOPO_CN = (('PIX', '最多经过一个 PCIe 桥（通常在同一个 PCIe Switch 下）'), ('PXB', '经过多个 PCIe 桥，但不经过 CPU'),
+           ('PHB', '经过 CPU 上的 PCIe Host Bridge'), ('NODE', '同一 NUMA 节点内，跨 PCIe Host Bridge'),
+           ('SYS', '跨 NUMA 节点（经过 CPU 之间的 QPI/UPI 等互联）'), ('SOC', '跨 CPU 插槽（旧版驱动的写法，同 SYS）'))
+# 内核模块的 taint 标志（/sys/module/<模块>/taint）
+TAINT_CN = {'P': '闭源', 'O': '树外编译', 'E': '未签名', 'F': '强制加载', 'C': 'staging 驱动', 'K': '热补丁',
+            'X': '辅助模块', 'T': '结构体随机化', 'N': '测试模块'}
+
+
 def render_nvlink(rep, ctx):
     gpus, topo, fm, pci = ctx['gpus'], ctx['topo'], ctx['fm'], ctx['pci']
-    rep.section('五、NVLink 拓扑')
+    nvsw = sorted(p['bdf'] for p in pci.values() if is_nvswitch(p))
+    rep.section('五、GPU 互联拓扑')
     if topo['ok']:
         labels = [l for l in topo['order'] if l.startswith('GPU')]
         rows = []
@@ -2471,13 +2531,15 @@ def render_nvlink(rep, ctx):
             rows.append(cells)
         rep.sub('GPU 互联矩阵（nvidia-smi topo -m）：')
         rep.table([''] + labels + ['就近的 CPU 核', 'NUMA 节点'], rows, aligns='l' + 'c' * len(labels))
-        rep.note('NV# = 通过 # 条 NVLink 互联（HGX 机型经过 NVSwitch）\n'
-                 'PIX = 最多经过一个 PCIe 桥（通常在同一个 PCIe Switch 下）；PXB = 经过多个 PCIe 桥，但不经过 CPU\n'
-                 'PHB = 经过 CPU 上的 PCIe Host Bridge；NODE = 同一 NUMA 节点内，跨 PCIe Host Bridge；'
-                 'SYS = 跨 NUMA 节点（经过 CPU 之间的 QPI/UPI 等互联）')
+        # 图例只解释矩阵里出现过的连接方式
+        codes = set(topo['rows'][a].get(b) for a in labels for b in labels if a != b)
+        nv = sorted((c for c in codes if c and c.startswith('NV')), key=lambda c: int(re.sub(r'\D', '', c) or 0))
+        legend = ['%s = 通过 %s 条 NVLink 互联%s' % (c, c[2:], '（经过 NVSwitch）' if nvsw else '') for c in nv]
+        legend += ['%s = %s' % kv for kv in TOPO_CN if kv[0] in codes]
+        if legend:
+            rep.note('\n'.join(legend))
     else:
         rep.note('无法获取 GPU 互联矩阵：%s' % s(topo.get('error'), 'nvidia-smi 不可用'))
-    nvsw = sorted(p['bdf'] for p in pci.values() if is_nvswitch(p))
     sw_idx = dict((b, i) for i, b in enumerate(nvsw))
     gpu_idx = dict((g['bdf'], g['idx']) for g in gpus)
     rows = []
@@ -2507,7 +2569,7 @@ def render_nvlink(rep, ctx):
     elif any(g['db'] and g['db'].get('links') for g in gpus):
         rep.note('没有读到 NVLink 链路信息')
     else:
-        rep.note('本机 GPU 无 NVLink（或没有装 NVLink 桥）')
+        rep.note('本机 GPU 之间没有 NVLink 连接，互相通信走 PCIe')
     if nvsw:
         devs = Counter(NVSWITCH_DB.get(pci[b]['device'], '0x%04x' % pci[b]['device']) for b in nvsw)
         rep.add('  NVSwitch: %d 颗（%s），PCI 地址 %s' % (len(nvsw), '，'.join('%s x%d' % kv for kv in devs.items()),
@@ -2600,9 +2662,12 @@ def render_eth(rep, ctx):
     for n in nics:
         model = MLX_DB.get(n['device']) if n['vendor'] == 0x15b3 else None
         model = model or names.get(n['bdf']) or ('%04x:%04x' % (n['vendor'], n['device']) if n['vendor'] else '-')
+        pci_addr = n['bdf'] if re.match(r'[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$', n['bdf'] or '') else None
+        if not pci_addr and re.match(r'\d+-[\d.]+:\d+\.\d+$', n['bdf'] or ''):     # USB 设备，如 1-11.3:2.0
+            model = 'USB 网卡' + ('（通常是 BMC 的虚拟网口）' if n['driver'] == 'cdc_ether' else '')
         sp = ('%dG' % (n['speed'] // 1000) if n['speed'] >= 1000 else '%dM' % n['speed']) if n['speed'] else '-'
         typ = 'IPoIB' if n['type'] == '32' else 'Ethernet'
-        rows.append([n['ifname'], clip(model, 44), typ, s(n['driver']), short_bdf(n['bdf']),
+        rows.append([n['ifname'], clip(model, 44), typ, s(n['driver']), short_bdf(pci_addr) if pci_addr else '-',
                      s(n['numa'] if (n['numa'] is not None and n['numa'] >= 0) else None), sp,
                      lv_cell(OK if n['state'] == 'up' else INFO, s(n['state'])), s(n['mtu'])])
     rep.table(['网口', '型号', '类型', '驱动', 'PCI 地址', 'NUMA', '速率', '状态', 'MTU'], rows)
@@ -2671,7 +2736,10 @@ def render_conclusion(rep, ctx, args):
             msg = clip(shown[0], 96) if shown else '未发现问题'
             if len(shown) > 1:
                 msg += '；另有 %d 项，见下方' % (len(shown) - 1)
-        rows.append([cat, lv_cell(lvl, LEVEL_TEXT[lvl]), msg])
+        if cat == 'NVLink' and not items and ctx.get('no_nvlink'):
+            rows.append([cat, '不涉及', '本机 GPU 之间没有 NVLink，互相通信走 PCIe'])
+        else:
+            rows.append([cat, lv_cell(lvl, LEVEL_TEXT[lvl]), msg])
     rep.table(['类别', '结果', '摘要'], rows)
     auth = auth_level(gpus)
     others = [(c, l, m) for c, l, m in Findings.items if l >= WARN and (c != '真伪' or auth == OK)]

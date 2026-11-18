@@ -3,7 +3,7 @@
 单文件脚本 `gpu_check.py`，只用 Python 3.6+ 标准库，不需要 pip 安装任何东西。在 GPU 服务器上运行，它会：
 
 - **收集硬件配置**：整机、CPU、内存、存储、GPU、NVLink 拓扑、IB / RDMA 网卡，在终端输出表格报告；
-- **核验 GPU 真伪**：按芯片熔丝决定的设备 ID 识别型号，再与驱动、NVML、nvidia-smi 报告的名称和规格指纹交叉比对。能识别 H20 / H800 冒充 H100、RTX 4090 D 冒充 4090、RTX PRO 6000D 冒充 RTX PRO 6000、矿卡冒充计算卡，以及 nvidia-smi 被篡改等情况；
+- **核验 GPU 真伪**：按芯片熔丝决定的设备 ID 识别型号，再与驱动、NVML、nvidia-smi 报告的名称和规格交叉比对。能识别 H20 / H800 冒充 H100、RTX 4090 D 冒充 4090、RTX PRO 6000D 冒充 RTX PRO 6000、矿卡冒充计算卡，以及 nvidia-smi 被篡改等情况；
 - **检查健康状况**：NVLink 掉链、IB 端口、PCIe 降速、Xid、ECC、行重映射等。
 
 型号库覆盖 Pascal 到 Blackwell 的 235 个设备 ID，包括数据中心卡、专业卡、GeForce 和矿卡，见「支持的型号」。
@@ -41,7 +41,7 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/gpu-check/main/run.sh | sudo
 要固定版本、不受仓库后续更新影响，就直接运行打了标签的版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rivia7/gpu-check/v1.4.0/gpu_check.py | sudo python3 -
+curl -fsSL https://raw.githubusercontent.com/rivia7/gpu-check/v1.4.1/gpu_check.py | sudo python3 -
 ```
 
 ### 服务器访问不了 GitHub 时
@@ -101,7 +101,7 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/gpu-check/v1.4.0/gpu_check.p
 |---|---|
 | 读 `/sys`、`/proc` 下的文件（PCI 配置空间头部、IB 端口状态和计数器、网卡 VPD） | 不创建 CUDA 上下文、不分配显存、不发起任何 GPU 计算 |
 | 执行只读查询：`nvidia-smi -q -x`、`nvidia-smi topo -m`、`nvidia-smi nvlink -s`、`nvidia-smi nvlink -e` | 不跑 NCCL、`ib_write_bw`、`nvbandwidth`、DCGM 诊断等压测或带宽测试 |
-| 通过 NVML 直连读取设备信息（只用 `nvmlInit`、`nvmlShutdown` 和 `nvmlDeviceGet*` 查询函数） | 不重置 NVLink/IB 错误计数（不用 `nvlink -r/-re`、`perfquery -R`） |
+| 直接调用 NVML 读取设备信息（只用 `nvmlInit`、`nvmlShutdown` 和 `nvmlDeviceGet*` 查询函数） | 不重置 NVLink/IB 错误计数（不用 `nvlink -r/-re`、`perfquery -R`） |
 | `dmidecode -t 17`、`lspci -D -mm -nn`、`lsblk`、`lscpu`、`dmesg`/`journalctl -k`、`systemctl show`、`ofed_info -s`、`dpkg --verify`/`rpm -V`（只比对校验和） | 不改时钟、功耗墙、ECC、MIG、持久模式、计算模式，不动 Fabric Manager 等服务 |
 | 以 `nice 19` + `ionice idle` 低优先级运行，每条外部命令都有超时（最长 120 秒） | 除 `-o` 指定的报告文件外，不写任何文件；只读取 `dmesg`，不清空内核日志缓冲区（不用 `-c`） |
 
@@ -111,10 +111,10 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/gpu-check/v1.4.0/gpu_check.p
 
 1. **系统概览**：机型、序列号、BIOS、OS/内核、NVIDIA 驱动（区分开源/闭源内核模块）、CUDA 版本、GSP 固件、Fabric Manager、OFED
 2. **CPU / 内存 / 存储**：CPU 型号与路数、NUMA、内存条型号/速率/槽位、NVMe 盘
-3. **GPU 清单**：型号、显存、功耗墙、最大频率、PCIe 能力、NUMA、VBIOS、序列号、模块号、板卡料号、InfoROM、UUID、持久模式/MIG/ECC
-4. **真伪核验**：每张卡逐项比对硬件 ID 和规格指纹，另有工具链完整性检查（见下节）
-5. **NVLink 拓扑**：`nvidia-smi topo -m` 互联矩阵（含 CPU 亲和）、每卡链路激活数/速率/错误计数/未激活链路、通过 NVML 读到的各卡到每颗 NVSwitch 的链路分布、NVSwitch 数量、Fabric Manager 状态
-6. **IB / RDMA 网卡**：型号、料号(PN)、序列号、固件、PSID、PCIe 当前/能力速率、端口状态/速率/LID、链路错误计数，以及每张 GPU 最近的 RDMA 网卡（GPUDirect RDMA 亲和）
+3. **GPU 清单**：型号、显存、功耗墙、最大频率、PCIe 最高规格、NUMA、VBIOS、序列号、模组 ID、板卡料号、InfoROM、UUID、持久模式/MIG/ECC
+4. **真伪核验**：每张卡逐项比对设备 ID 和规格，另有驱动软件完整性检查（见下节）
+5. **NVLink 拓扑**：`nvidia-smi topo -m` 互联矩阵（含每张 GPU 就近的 CPU 核和 NUMA 节点）、每卡链路激活数/速率/错误计数/未激活链路、通过 NVML 读到的各卡到每颗 NVSwitch 的链路分布、NVSwitch 数量、Fabric Manager 状态
+6. **IB / RDMA 网卡**：型号、料号(PN)、序列号、固件、PSID、PCIe 当前/最高速率、端口状态/速率/LID、链路错误计数，以及每张 GPU 最近的 RDMA 网卡（用于 GPUDirect RDMA）
 7. **其它网卡**：管理网卡等
 8. **GPU 运行状态快照**：温度、功耗、利用率、显存占用、进程数、ECC、行重映射、降频原因、Xid
 9. **检测结论**：按类别汇总，列出「需关注」项，给出总体结论
@@ -123,12 +123,12 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/gpu-check/v1.4.0/gpu_check.p
 
 结论来自几层互相独立的数据源，彼此必须一致：
 
-1. **硬件层**：PCI 设备 ID 由 GPU 芯片熔丝决定，改名字、贴标签、改 nvidia-smi 都改不了。脚本既读内核缓存的 ID，也直接读 PCI 配置空间，两者对比。
-2. **驱动层**：`/proc/driver/nvidia` 里的型号、NVML 直连读到的型号和 PCI ID（绕过 nvidia-smi 程序，直接调 `libnvidia-ml.so`）、nvidia-smi 的输出，三者都必须和硬件 ID 对得上；nvidia-smi 和 NVML 报的显存、功耗墙、频率、序列号也要一致。
-3. **规格指纹**：SM 数（NVML 核心数 ÷ 每 SM 核心数）、显存位宽、显存容量、最大功耗墙、最大频率、NVLink 链路数、架构与计算能力、GPU 部件号前缀，与该型号的标准值比对。
-4. **工具链**：nvidia-smi 是否为原厂 ELF、包管理器校验和是否一致、驱动各组件版本是否一致、`/etc/ld.so.preload` 和 `LD_PRELOAD` 劫持。
+1. **设备 ID**：PCI 设备 ID 由 GPU 芯片熔丝决定，改名字、贴标签、改 nvidia-smi 都改不了。脚本既读内核缓存的 ID，也直接读 PCI 配置空间，两者对比。
+2. **驱动报告的型号**：`/proc/driver/nvidia` 里的型号、直接调用 NVML（`libnvidia-ml.so`，绕过 nvidia-smi 程序）读到的型号和 PCI ID、nvidia-smi 的输出，三者都必须和设备 ID 对得上；nvidia-smi 和 NVML 报的显存、功耗墙、频率、序列号也要一致。
+3. **规格比对**：SM 数（NVML 核心数 ÷ 每 SM 核心数）、显存位宽、显存容量、最大功耗墙、最大频率、NVLink 链路数、架构与计算能力、GPU 部件号前缀，与该型号的标准值比对。
+4. **驱动软件**：nvidia-smi 是否为原厂 ELF 二进制文件、与软件包里的原始文件是否一致（包管理器校验和）、驱动各组件版本是否一致、`/etc/ld.so.preload` 和 `LD_PRELOAD` 劫持。
 
-关键项（硬件 ID、型号名、SM 数、显存位宽、显存容量、架构、nvidia-smi 与 NVML 一致性）有矛盾时判「不通过」或「待确认」：H100 SXM5/PCIe 这类参考值可信度高的型号直接判不通过，其它型号先判待确认。功耗墙、频率、部件号这类非关键项有偏差时只告警，不影响真伪结论。
+关键项（设备 ID、型号名、SM 数、显存位宽、显存容量、架构、nvidia-smi 与 NVML 一致性）有矛盾时判「不通过」或「待确认」：H100 SXM5/PCIe 这类参考值可信度高的型号直接判不通过，其它型号先判待确认。功耗墙、频率、部件号这类非关键项有偏差时只告警，不影响真伪结论。
 
 常见设备 ID（来源：pci.ids 与 NVIDIA 驱动 README 的支持列表）：
 
@@ -165,7 +165,7 @@ curl -fsSL https://raw.githubusercontent.com/rivia7/gpu-check/v1.4.0/gpu_check.p
 不同类型的卡，检查侧重不同：
 
 - **消费级卡**的功耗墙和最大频率随板卡厂商不同，不做比对；ECC 默认关闭属正常，不告警；不支持 GPUDirect RDMA，不提示 `nvidia_peermem`。
-- **改装大显存**（如 48GB 的 RTX 4090、22GB 的 RTX 2080 Ti）：显存明显大于官方规格时，结论为「真 RTX 4090(改装48G显存)」并给出告警。芯片是真的，但板卡不是原厂设计，要留意稳定性和保修。
+- **改装大显存**（如 48GB 的 RTX 4090、22GB 的 RTX 2080 Ti）：显存明显大于官方规格时，结论为「真 RTX 4090（改装 48GB 显存）」并给出告警。芯片是真的，但板卡不是原厂设计，要留意稳定性和保修。
 - **数据中心卡**关闭 ECC 时告警。GDDR 显存开 ECC 会占掉 1/16 容量，两种容量都按标准处理。
 
 ## 型号库的来源与核实
@@ -214,7 +214,7 @@ python3 -I tools/verify_db.py --dbgpu    # 另外与 TechPowerUp 数据比对规
 
 - **内核级伪造防不住**：如果有人改了内核（例如修改开源内核模块，或在 PCI 层伪造设备 ID），所有软件读到的数据都可能是假的。脚本会显示内核模块的 srcversion 和 taint 标志，可与同版本的正常机器比对。
 - **不做算力实测**：要确认实际算力，需要在维护窗口对空闲 GPU 单独压测（比如跑 BF16 GEMM：H100 SXM5 稠密 BF16 理论约 989 TFLOPS，H20 约 148 TFLOPS）。这会占用 GPU，所以脚本有意不做。
-- H20 系列等特供型号没有官方公开的完整规格，判定以硬件 ID 为主，规格只作辅助参考。型号库只写入有可靠来源的规格（见「型号库的来源与核实」），非关键项有偏差时只告警。
+- H20 系列等特供型号没有官方公开的完整规格，判定以设备 ID 为主，规格只作辅助参考。型号库只写入有可靠来源的规格（见「型号库的来源与核实」），非关键项有偏差时只告警。
 - H100 的检测目前只在模拟环境里测试过（见下节），还没在真实 H100 机器上跑过；RTX 4090、RTX PRO 6000D 的测试场景取自真实机器的报告。首次使用建议先在一台确定是正品的机器上跑一遍，作为基线对照。
 
 ## 自建中转
@@ -246,7 +246,7 @@ curl http://127.0.0.1/gpu/      # 使用说明、可用版本、最近同步时�
 ```bash
 curl -fsSL http://<中转站>/gpu/run.sh | sudo bash                        # 最新版（main）
 curl -fsSL http://<中转站>/gpu/run.sh | sudo bash -s -- --expect any      # 带参数
-curl -fsSL http://<中转站>/gpu/v1.4.0/run.sh | sudo bash                 # 指定版本
+curl -fsSL http://<中转站>/gpu/v1.4.1/run.sh | sudo bash                 # 指定版本
 ```
 
 中转站走 HTTP 明文。链路不可信时，可以拿 `<版本>/SHA256SUMS` 里 `gpu_check.py` 的哈希与 GitHub 上的文件比对。
@@ -268,9 +268,9 @@ PYTHON=python3.9 bash tests/run_tests.sh     # 指定解释器
 | 场景 | 期望结果 |
 |---|---|
 | `h100` | 正常 HGX H100 SXM5 8 卡 → 通过 |
-| `h20-fake` | 硬件是 H20，nvidia-smi 被篡改成显示 H100 → 不通过（硬件 ID、PCI ID、显存、包校验多处露馅） |
+| `h20-fake` | 硬件是 H20，nvidia-smi 被篡改成显示 H100 → 不通过（设备 ID、PCI ID、显存、包校验多处露馅） |
 | `h20` / `h800` | 诚实的 H20 / H800 机器 → 不通过 |
-| `degraded` | 真 H100，但 NVLink 掉链、IB 端口 down、PCIe 降速、FM 未运行、Xid 79、行重映射待处理、ECC 错误 → 通过，有告警 |
+| `degraded` | 真 H100，但 NVLink 掉链、IB 端口 down、PCIe 降速、FM 未运行、Xid 79、行重映射待生效、ECC 错误 → 通过，有告警 |
 | `nodriver` | 真 H100 硬件，但驱动未加载 → 待确认 |
 | `runfile` | 真 H100，驱动用 .run 覆盖安装在旧版 deb 包之上 → 通过，有告警（不误判为篡改） |
 | `h100 --expect h100-nvlink` | 同义写法 → 通过 |

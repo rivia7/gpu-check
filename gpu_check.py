@@ -39,12 +39,12 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from collections import Counter
 
-VERSION = '1.4.0'
+VERSION = '1.4.1'
 DEFAULT_EXPECT = 'h100-sxm'   # 默认核验 H100 SXM5，即国内常说的“NVLink 版”（HGX 机型）
 
 OK, INFO, WARN, FAIL = 0, 1, 2, 3
 LEVEL_TEXT = {OK: '通过', INFO: '提示', WARN: '警告', FAIL: '不通过'}
-CATEGORIES = ['真伪', '工具链', 'NVLink', 'IB/RDMA', 'PCIe', 'GPU健康', '系统']
+CATEGORIES = ['真伪', '驱动软件', 'NVLink', 'IB/RDMA', 'PCIe', 'GPU 健康', '系统']
 
 
 class G(object):
@@ -88,11 +88,11 @@ def _sku(sku, family, form, mem, arch='Hopper', **kw):
     return d
 
 
-_H20 = '面向中国市场的算力阉割特供版（BF16 稠密算力约为 H100 SXM 的 15%）'
-_H800 = '面向中国市场的特供版（NVLink 带宽阉割为 400GB/s，H100 SXM 为 900GB/s）'
-_ES = '未命名的 GH100 设备 ID，可能是工程样品（ES/QS），并非正式零售 H100'
-_A800 = '面向中国市场的特供版（NVLink 带宽阉割为 400GB/s，A100 SXM 为 600GB/s）'
-_L20 = '面向中国市场的特供版（由 L40S 阉割而来，SM 数约为其 2/3）'
+_H20 = '面向中国市场的特供版，算力大幅削减（BF16 算力约为 H100 SXM 的 15%）'
+_H800 = '面向中国市场的特供版，NVLink 带宽削减到 400GB/s（H100 SXM 为 900GB/s）'
+_ES = '没有正式型号名，可能是工程样品（ES/QS），不是正式量产的 H100'
+_A800 = '面向中国市场的特供版，NVLink 带宽削减到 400GB/s（A100 SXM 为 600GB/s）'
+_L20 = '面向中国市场的特供版，由 L40S 削减而来（SM 数约为 L40S 的 2/3）'
 _CN = '面向中国市场的特供版'
 _4090D = '面向中国市场的特供版（114 个 SM，RTX 4090 为 128 个，算力低约 5%~10%）'
 _5090D = '面向中国市场的特供版（AI 算力受驱动/固件限制）'
@@ -129,10 +129,10 @@ GPU_DB = {
     0x2342: _sku('GH200 Grace Hopper', 'GH200', 'Superchip', None),
     0x2348: _sku('GH200 144GB HBM3e', 'GH200', 'Superchip', 144),
     # ---- 未命名 GH100 ----
-    0x2302: _sku('GH100 未命名ID', 'GH100?', '?', None, note=_ES),
-    0x2343: _sku('GH100 未命名ID', 'GH100?', '?', None, note=_ES),
+    0x2302: _sku('GH100 未命名 ID', 'GH100?', '?', None, note=_ES),
+    0x2343: _sku('GH100 未命名 ID', 'GH100?', '?', None, note=_ES),
     0x2345: _sku('GH100-88K-A1', 'GH100?', '?', None, note=_ES),
-    0x237e: _sku('GH100 未命名ID', 'GH100?', '?', None, note=_ES),
+    0x237e: _sku('GH100 未命名 ID', 'GH100?', '?', None, note=_ES),
 }
 
 
@@ -401,20 +401,22 @@ MLX_DB = {
     0x1018: 'ConnectX-5 VF', 0x101a: 'ConnectX-5 Ex VF', 0x101c: 'ConnectX-6 VF', 0x101e: 'ConnectX VF',
 }
 
+# Xid 是 NVIDIA 驱动写进内核日志的 GPU 错误码；报告里写成“Xid 79（说明）”，所以说明里不再用括号
 XID_DESC = {
-    13: '图形引擎异常（多为应用问题）', 31: 'GPU 内存页错误（多为应用问题）',
-    43: 'GPU 停止处理（多为应用问题）', 45: '抢占清理（进程被终止）', 48: '双比特 ECC 错误',
-    61: '内部微控制器断点', 62: '内部微控制器挂起', 63: 'ECC 页退役/行重映射事件',
-    64: 'ECC 页退役/行重映射失败', 68: '视频解码引擎异常', 69: '图形引擎类错误', 74: 'NVLink 错误',
-    79: 'GPU 掉卡（fallen off the bus）', 92: '单比特 ECC 错误率过高', 94: '可控 ECC 错误（contained）',
-    95: '不可控 ECC 错误（uncontained）', 109: '上下文切换超时', 119: 'GSP RPC 超时', 120: 'GSP 错误',
+    13: '图形引擎异常，多为应用问题', 31: 'GPU 访问显存出错，多为应用问题',
+    43: 'GPU 停止处理，多为应用问题', 45: '进程被终止后的清理', 48: '双比特 ECC 错误，无法纠正',
+    61: 'GPU 内部微控制器报错', 62: 'GPU 内部微控制器停止响应', 63: '显存坏页已屏蔽或已做行重映射',
+    64: '显存坏页屏蔽或行重映射失败', 68: '视频解码引擎异常', 69: '图形引擎类错误', 74: 'NVLink 错误',
+    79: 'GPU 掉卡，fallen off the bus', 92: '单比特 ECC 错误过多', 94: 'ECC 错误，已隔离，只影响出错的进程',
+    95: 'ECC 错误，未能隔离，需要复位 GPU', 109: '上下文切换超时', 119: 'GSP RPC 超时', 120: 'GSP 错误',
 }
 XID_APP = {13, 31, 43, 45, 68, 69, 109}
 
 THROTTLE_CN = {
-    'sw_power_cap': '软件功耗墙', 'hw_slowdown': '硬件降频', 'hw_thermal_slowdown': '硬件过热降频',
-    'hw_power_brake_slowdown': '功耗刹车', 'sw_thermal_slowdown': '软件过热降频',
-    'sync_boost': '同步加速', 'applications_clocks_setting': '应用时钟', 'display_clocks_setting': '显示时钟',
+    'sw_power_cap': '触发功耗墙', 'hw_slowdown': '硬件降频', 'hw_thermal_slowdown': '硬件过热降频',
+    'hw_power_brake_slowdown': '电源侧强制降频(power brake)', 'sw_thermal_slowdown': '驱动过热降频',
+    'sync_boost': '与同组 GPU 同步频率', 'applications_clocks_setting': '受应用时钟设置限制',
+    'display_clocks_setting': '受显示时钟设置限制',
 }
 THROTTLE_BAD = {'hw_slowdown', 'hw_thermal_slowdown', 'hw_power_brake_slowdown', 'sw_thermal_slowdown'}
 
@@ -806,7 +808,7 @@ def collect_memory():
         mem['total_gib'] = int(mt.group(1)) / 1048576.0
     dmi = which('dmidecode')
     if not G.is_root:
-        mem['dimm_note'] = '需 root 运行 dmidecode'
+        mem['dimm_note'] = '需要 root 权限运行 dmidecode'
     elif not dmi:
         mem['dimm_note'] = '未安装 dmidecode'
     else:
@@ -916,7 +918,7 @@ def loaded_modules():
 
 
 # ============================================================================
-# 采集：NVIDIA 驱动、工具链完整性
+# 采集：NVIDIA 驱动、驱动软件完整性
 # ============================================================================
 
 def collect_driver():
@@ -964,8 +966,8 @@ def pkg_verify(path):
             rc2, out2, _ = run(['dpkg', '--verify', pkg], 90)
             for l2 in out2.splitlines():
                 if l2.rstrip().endswith(path) and len(l2) > 2 and l2[2] == '5':
-                    return pkg, ver.strip(), False, '文件校验和与软件包 %s 不一致' % pkg
-            return pkg, ver.strip(), True, 'dpkg 校验一致（%s %s）' % (pkg, ver.strip())
+                    return pkg, ver.strip(), False, '与软件包 %s 里的原始文件不一致（校验和不同）' % pkg
+            return pkg, ver.strip(), True, '与软件包 %s %s 里的原始文件一致（dpkg 校验）' % (pkg, ver.strip())
     if which('rpm'):
         rc, out, _ = run(['rpm', '-qf', '--qf', '%{NAME} %{VERSION}\n', path], 20)
         parts = first_line(out).split()
@@ -974,9 +976,9 @@ def pkg_verify(path):
             rc2, out2, _ = run(['rpm', '-V', pkg], 90)
             for l2 in out2.splitlines():
                 if l2.rstrip().endswith(path) and len(l2) > 2 and l2[2] == '5':
-                    return pkg, ver, False, '文件校验和与软件包 %s 不一致' % pkg
-            return pkg, ver, True, 'rpm 校验一致（%s %s）' % (pkg, ver)
-    return None, None, None, '非包管理器安装（如 .run 安装），无法做包校验'
+                    return pkg, ver, False, '与软件包 %s 里的原始文件不一致（校验和不同）' % pkg
+            return pkg, ver, True, '与软件包 %s %s 里的原始文件一致（rpm 校验）' % (pkg, ver)
+    return None, None, None, '不是用包管理器安装的（如用 .run 安装包安装），没有软件包可以比对'
 
 
 def file_check(path):
@@ -1257,6 +1259,9 @@ def _cs(buf):
         return None
 
 
+NVML_ERR = {4: '权限不足', 9: '驱动未加载', 12: '找不到驱动库', 18: 'NVML 库与内核模块版本不一致', 999: '未知错误'}
+
+
 def collect_nvml(libname):
     res = {'ok': False, 'error': None, 'gpus': {}, 'lib': None, 'driver': None}
     try:
@@ -1277,7 +1282,7 @@ def collect_nvml(libname):
         return res
     rc = init()
     if rc != 0:
-        res['error'] = 'nvmlInit 失败（错误码 %d）' % rc
+        res['error'] = 'nvmlInit 失败（错误码 %d%s）' % (rc, '，' + NVML_ERR[rc] if rc in NVML_ERR else '')
         return res
     byref, c_uint, c_int = ctypes.byref, ctypes.c_uint, ctypes.c_int
     try:
@@ -1541,7 +1546,7 @@ def collect_xid():
             rc, out, _ = run([jc, '-k', '-b', '--no-pager', '-o', 'cat'], 40)
             res['src'] = 'journalctl -k -b'
     if rc != 0:
-        res['error'] = '无法读取内核日志（通常需要 root）'
+        res['error'] = '无法读取内核日志（通常需要 root 权限）'
         return res
     for line in out.splitlines():
         m = re.search(r'NVRM: Xid \(PCI:([0-9a-fA-F]{4,8}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2})\): (\d+)', line)
@@ -1643,7 +1648,7 @@ def parse_expect(text):
 def unknown_check(devid, names, exp):
     """型号库和本机 pci.ids 都不认识的设备 ID：只能参考驱动报告的名称。
     驱动名称可能被篡改成期望的型号，所以名称相符也只能判“待确认”；但名称明确是别的型号时，可以判“不是期望型号”。"""
-    why = '设备 ID 0x%04x 不在内置型号库中，本机 pci.ids 也无法识别（可能是新型号或工程样品）' % devid
+    why = '设备 ID 0x%04x 不在内置型号库中，本机的 pci.ids 也不认识（可能是新型号或工程样品）' % devid
     shown = sorted(set(nm for _, nm in names))
     if not shown:
         return WARN, why
@@ -1652,10 +1657,10 @@ def unknown_check(devid, names, exp):
     if exp is not None and keys and exp['key'] not in keys:
         return FAIL, why + '，不是 %s' % exp['fam']
     if len(keys) > 1:
-        return WARN, why + '，各来源报告的型号不一致，无法核验'
+        return WARN, why + '，各来源报告的型号互相矛盾，无法判断'
     if exp is not None and keys:
-        return WARN, why + '，与期望的 %s 一致，但无法用硬件 ID 独立核验' % exp['fam']
-    return WARN, why + '，无法用硬件 ID 独立核验'
+        return WARN, why + '，与期望的 %s 一致；但驱动名称可能被篡改，又无法用设备 ID 核对，所以只能判待确认' % exp['fam']
+    return WARN, why + '；驱动名称可能被篡改，又无法用设备 ID 核对，所以无法确认型号'
 
 
 def expect_hint(gpus, exp):
@@ -1673,28 +1678,31 @@ def expect_hint(gpus, exp):
                 if t not in toks:
                     toks.append(t)
                 break
-    how = '请加 --expect %s' % ' 或 '.join(toks) if 0 < len(toks) <= 3 else '请用 --expect 指定期望的型号'
-    return '本次按默认目标 %s 核验。如果要核验的就是本机这种型号，%s；也可以用 --expect any 只做一致性检查。' % (exp['label'], how)
+    how = ('请加 --expect %s 重新检测' % ' 或 '.join(toks) if 0 < len(toks) <= 3
+           else '请用 --expect 指定期望的型号后重新检测')
+    model = '就是 ' + _skus(gpus) if all(g['db'] for g in gpus) else '就不是 ' + exp['fam']
+    return ('本次按默认目标 %s 核验。如果这台机器本来%s，%s；'
+            '也可以用 --expect any，不限型号，只检查各项数据是否一致。' % (exp['label'], model, how))
 
 
 def expect_check(db, exp):
     sku, note = db['sku'], db['note']
     via = '（型号库中没有该设备 ID，按本机 pci.ids 识别）' if db.get('src') == 'pci.ids' else ''
     if exp is None:
-        return OK, '硬件识别为 %s%s' % (sku, via)
+        return OK, '按设备 ID 识别为 %s%s' % (sku, via)
     keys = db_keys(db)
     if exp['key'] in keys:
         if exp['form'] and not db['form'].upper().startswith(exp['form']):
             if db['form'] == '?':
-                return WARN, '无法从设备 ID 确定 %s 的形态（SXM / PCIe / NVL），未能确认是否为 %s 版' % (sku, exp['label'])
+                return WARN, '无法从设备 ID 判断 %s 是 SXM、PCIe 还是 NVL 形态，不能确认是不是 %s 版' % (sku, exp['label'])
             sfx = {'P': 'pcie', 'N': 'nvl', 'S': 'sxm'}.get(db['form'][:1].upper())
-            hint = ('（如果采购的就是 %s 版，请加 --expect %s-%s）' % (db['form'], exp['fam'].lower().replace(' ', ''), sfx)
-                    if sfx else '')
+            hint = ('（如果采购的就是 %s 版，请加 --expect %s-%s 重新检测）'
+                    % (db['form'], exp['fam'].lower().replace(' ', ''), sfx) if sfx else '')
             return FAIL, '实为 %s，与期望的 %s 版不符%s' % (sku, exp['label'], hint)
-        return OK, '硬件识别为 %s%s' % (sku, via)
+        return OK, '按设备 ID 识别为 %s%s' % (sku, via)
     if exp['key'] == 'H100':
         if db['family'] == 'GH100?':
-            return WARN, '设备 ID 属于 GH100 但%s' % note.replace('未命名的 GH100 设备 ID，', '')
+            return WARN, '设备 ID 属于 GH100 芯片，但%s' % note
         if db['family'] in ('H200', 'GH200'):
             return WARN, '实为 %s，不是 H100（规格高于 H100）' % sku
     return FAIL, '实为 %s，不是 %s%s' % (sku, exp['fam'], (' —— ' + note) if note else '')
@@ -1717,12 +1725,12 @@ def evaluate_gpu(g, target):
     mig = smi and smi.get('mig') == 'Enabled'
 
     srcs = [('nvidia-smi', smi and smi.get('name')), ('NVML', nv and nv.get('name')),
-            ('驱动(/proc)', pr and pr.get('model')), ('CUDA', cu and cu.get('name'))]
+            ('驱动（/proc）', pr and pr.get('model')), ('CUDA', cu and cu.get('name'))]
     names = [(src, nm) for src, nm in srcs if nm]
 
     # 1. 硬件设备 ID（PCI 配置空间，芯片熔丝决定）
     if p is None:
-        add('hwid', WARN, '-', 'sysfs 中找不到该 GPU 的 PCI 设备，无法做硬件 ID 核验')
+        add('hwid', WARN, '-', '在 /sys 里找不到这张 GPU 的 PCI 设备，无法核对设备 ID')
     elif db is None:
         lvl, why = unknown_check(devid, names, target)
         add('hwid', lvl, '0x%04x' % devid, why)
@@ -1733,28 +1741,30 @@ def evaluate_gpu(g, target):
     cfg = g['cfg']
     if p and cfg:
         if cfg['vendor'] == 0xffff:
-            add('cfg', WARN, '无响应', 'PCI 配置空间读回 0xFFFF，GPU 可能已掉卡或正在复位')
+            add('cfg', WARN, '无响应', 'PCI 配置空间读出来全是 0xFFFF，GPU 可能已掉卡或正在复位')
         elif (cfg['vendor'], cfg['device']) != (p['vendor'], p['device']):
-            add('cfg', FAIL, '不一致', '实时读取的设备 ID 0x%04x 与内核缓存值 0x%04x 不一致（疑似内核级伪造）'
-                % (cfg['device'], p['device']))
+            add('cfg', FAIL, '不一致', '直接读 PCI 配置空间得到的设备 ID 是 0x%04x，与内核记录的 0x%04x 不一致，'
+                '疑似在内核层面伪造' % (cfg['device'], p['device']))
     # 3. 名称一致性：nvidia-smi / NVML / 驱动 /proc / CUDA 都要与硬件 ID 同一型号家族
     if not names:
-        add('names', WARN, '无数据', '驱动未加载或 nvidia-smi/NVML 不可用，只完成了硬件 ID 核验')
+        add('names', WARN, '无数据', '驱动未加载，或 nvidia-smi、NVML 不可用：只核对了设备 ID，'
+            '没能与驱动报告的型号和规格交叉比对')
     elif keys:
-        bad = ['%s 报告“%s”' % (src, nm) for src, nm in names if model_key(nm) and model_key(nm) not in keys]
-        unk = ['%s 报告“%s”' % (src, nm) for src, nm in names if not model_key(nm)]
+        bad = ['%s 报告的型号是“%s”' % (src, nm) for src, nm in names if model_key(nm) and model_key(nm) not in keys]
+        unk = ['%s 报告的型号是“%s”' % (src, nm) for src, nm in names if not model_key(nm)]
         if bad:
-            add('names', FAIL, '不一致', '型号名称与硬件 ID（%s）不符：%s —— 疑似 nvidia-smi/驱动被篡改'
+            add('names', FAIL, '不一致', '按设备 ID 应为 %s，但名称对不上：%s，疑似 nvidia-smi 或驱动被篡改'
                 % (db['sku'], '；'.join(bad)))
         elif unk:
-            add('names', WARN, '无法识别', '无法从名称识别型号，未能与硬件 ID（%s）比对：%s' % (db['sku'], '；'.join(unk)))
+            add('names', WARN, '无法识别', '认不出以下名称是什么型号，没法与设备 ID 对应的 %s 比对：%s'
+                % (db['sku'], '；'.join(unk)))
         else:
             add('names', OK, '一致', '、'.join(src for src, _ in names) + ' 均为 ' + db['family'])
     else:
         add('names', INFO, '-', '名称：' + '；'.join('%s=%s' % x for x in names))
     for src, nm in names:
         if 'Graphics Device' in nm:
-            add('es', WARN, nm, '%s 显示为“%s”（驱动不认识的设备，可能是工程样品）' % (src, nm))
+            add('es', WARN, nm, '%s 报告的名称是“%s”，说明驱动不认识这个设备，可能是工程样品' % (src, nm))
             break
     # 4. 软件层上报的 PCI ID 是否与硬件一致
     if p:
@@ -1764,22 +1774,22 @@ def evaluate_gpu(g, target):
             try:
                 v = int(smi['pci_devid'], 16)
                 if (v >> 16, v & 0xffff) != hw_pair:
-                    bad.append('nvidia-smi 上报设备 ID 0x%04x' % (v >> 16))
+                    bad.append('nvidia-smi 报告的设备 ID 是 0x%04x' % (v >> 16))
             except ValueError:
                 pass
             if smi.get('pci_subsys') and p.get('sdevice') is not None:
                 try:
                     v = int(smi['pci_subsys'], 16)
                     if v >> 16 != p['sdevice']:
-                        bad.append('nvidia-smi 上报子系统 ID 0x%04x（硬件 0x%04x）' % (v >> 16, p['sdevice']))
+                        bad.append('nvidia-smi 报告的子系统 ID 是 0x%04x（硬件是 0x%04x）' % (v >> 16, p['sdevice']))
                 except ValueError:
                     pass
         if nv and nv.get('pci_devid') is not None:
             v = nv['pci_devid']
             if (v >> 16, v & 0xffff) != hw_pair:
-                bad.append('NVML 上报设备 ID 0x%04x' % (v >> 16))
+                bad.append('NVML 报告的设备 ID 是 0x%04x' % (v >> 16))
         if bad:
-            add('swid', FAIL, '不一致', '软件上报的 PCI ID 与硬件 0x%04x 不符：%s —— 疑似篡改'
+            add('swid', FAIL, '不一致', '软件报告的 PCI ID 与硬件实际值不符（硬件设备 ID 是 0x%04x）：%s，疑似被篡改'
                 % (p['device'], '；'.join(bad)))
     # 5. SM 数（NVML 核心数 ÷ 每 SM 核心数（由计算能力决定），或 --cuda 读到的 SM 数）
     sm, sm_src = None, None
@@ -1790,14 +1800,14 @@ def evaluate_gpu(g, target):
         sm, sm_src = nv['cores'] // cps, 'NVML'
     exp = db and db.get('sms')
     if sm is None:
-        add('sm', INFO, '-', '驱动未提供 SM 数（可加 --cuda 读取）')
+        add('sm', INFO, '-', '驱动没有提供 SM 数（可以加 --cuda 读取）')
     elif not exp:
         add('sm', INFO, str(sm), '')
     elif sm == exp:
         add('sm', OK, str(sm), '')
     else:
         add('sm', FAIL if db['strict'] else WARN, str(sm),
-            'SM 数 %d（%s）与 %s 标准值 %d 不符' % (sm, sm_src, db['sku'], exp))
+            'SM 数为 %d（来自 %s），%s 的标准值是 %d' % (sm, sm_src, db['sku'], exp))
     # 6. 显存位宽
     bw = (nv and nv.get('bus_width')) or (cu and cu.get('bus_width'))
     exp = db and db.get('bus')
@@ -1807,7 +1817,7 @@ def evaluate_gpu(g, target):
         add('bus', OK if exp else INFO, str(bw), '')
     else:
         add('bus', FAIL if db['strict'] else WARN, str(bw),
-            '显存位宽 %d-bit 与 %s 标准值 %d-bit 不符' % (bw, db['sku'], exp))
+            '显存位宽为 %d-bit，%s 的标准值是 %d-bit' % (bw, db['sku'], exp))
     # 7. 显存容量（优先取 NVML 直连值：nvidia-smi 程序本身可能被替换）
     mib_nv = nv['mem_total'] / 1048576.0 if (nv and nv.get('mem_total')) else None
     mib_smi = smi and smi.get('mem_total')
@@ -1827,10 +1837,11 @@ def evaluate_gpu(g, target):
             add('mem', OK, val, '')
         elif db['tier'] != 'dc' and gib > max(exps) * 1.2:
             g['memmod'] = int(round(gib))
-            add('mem', WARN, val, '显存 %.1f GiB，%s 官方规格为 %s GB —— 大于官方规格，疑似改装大显存（魔改卡），'
-                '芯片为真但板卡非原厂设计，注意稳定性与保修' % (gib, db['sku'], std), crit=False)
+            add('mem', WARN, val, '显存 %.1f GiB，比 %s 的官方规格 %s GB 大，疑似改装大显存（俗称魔改卡）：'
+                'GPU 芯片是真的，但板卡不是原厂设计，要留意稳定性和保修' % (gib, db['sku'], std), crit=False)
         else:
-            add('mem', FAIL if db['strict'] else WARN, val, '显存 %.1f GiB 与 %s 标称 %s GB 不符' % (gib, db['sku'], std))
+            add('mem', FAIL if db['strict'] else WARN, val,
+                '显存 %.1f GiB，与 %s 的标称容量 %s GB 不符' % (gib, db['sku'], std))
     # 8. 最大功耗墙（VBIOS 决定）
     p_nv, p_smi = nv and nv.get('power_max'), smi and smi.get('power_max')
     pmax = p_nv or p_smi
@@ -1841,36 +1852,36 @@ def evaluate_gpu(g, target):
     elif not exps or any(abs(pmax - e) <= e * 0.03 for e in exps):
         add('power', OK if exps else INFO, '%dW' % pmax, '')
     else:
-        add('power', WARN, '%dW' % pmax, '最大功耗墙 %d W 与 %s 标准值 %s W 不符（VBIOS 非标准或型号不符）'
+        add('power', WARN, '%dW' % pmax, '最大功耗墙为 %d W，%s 的标准值是 %s W（可能刷过非原厂 VBIOS，或者型号不对）'
             % (pmax, db['sku'], '/'.join(str(e) for e in exps)))
     # 9. 最大频率
     msm = (nv and nv.get('max_sm')) or (smi and smi.get('max_sm'))
     mmem = (nv and nv.get('max_mem')) or (smi and smi.get('max_mem'))
     bad = []
     if db and db.get('maxsm') and msm and abs(msm - db['maxsm']) > db['maxsm'] * 0.02:
-        bad.append('SM %d MHz（标准 %d）' % (msm, db['maxsm']))
+        bad.append('SM %d MHz（标准值 %d MHz）' % (msm, db['maxsm']))
     if db and db.get('maxmem') and mmem and abs(mmem - db['maxmem']) > db['maxmem'] * 0.02:
-        bad.append('显存 %d MHz（标准 %d）' % (mmem, db['maxmem']))
+        bad.append('显存 %d MHz（标准值 %d MHz）' % (mmem, db['maxmem']))
     clk = '%s/%s' % (s(msm and int(msm)), s(mmem and int(mmem))) if (msm or mmem) else '-'
     if bad:
-        add('clock', WARN, clk, '最大频率与 %s 不符：%s' % (db['sku'], '，'.join(bad)))
+        add('clock', WARN, clk, '最大频率与 %s 的标准值不符：%s' % (db['sku'], '，'.join(bad)))
     else:
         add('clock', OK if (db and db.get('maxsm') and msm) else INFO, clk, '')
     # nvidia-smi 与 NVML 直连的数值必须一致（同一份驱动数据，差异只能来自篡改）
     diffs = []
     if mib_nv and mib_smi and abs(mib_nv - mib_smi) > 0.03 * mib_nv:
-        diffs.append('显存 %d/%d MiB' % (mib_smi, mib_nv))
+        diffs.append('显存（nvidia-smi %d MiB，NVML %d MiB）' % (mib_smi, mib_nv))
     if p_nv and p_smi and abs(p_nv - p_smi) > 0.02 * p_nv:
-        diffs.append('最大功耗墙 %d/%d W' % (p_smi, p_nv))
+        diffs.append('最大功耗墙（nvidia-smi %d W，NVML %d W）' % (p_smi, p_nv))
     for key, label in (('max_sm', '最大 SM 频率'), ('max_mem', '最大显存频率')):
         a, b = smi and smi.get(key), nv and nv.get(key)
         if a and b and abs(a - b) > 0.02 * b:
-            diffs.append('%s %d/%d MHz' % (label, a, b))
+            diffs.append('%s（nvidia-smi %d MHz，NVML %d MHz）' % (label, a, b))
     if smi and nv and smi.get('serial') and nv.get('serial') and smi['serial'] != nv['serial']:
-        diffs.append('序列号 %s/%s' % (smi['serial'], nv['serial']))
+        diffs.append('序列号（nvidia-smi %s，NVML %s）' % (smi['serial'], nv['serial']))
     if diffs:
-        add('smi_nvml', FAIL, '不一致', 'nvidia-smi 与 NVML 直连数据不一致（前者/后者）：%s —— nvidia-smi 输出疑似被篡改'
-            % '；'.join(diffs))
+        add('smi_nvml', FAIL, '不一致', 'nvidia-smi 与直接调用 NVML 读到的数据不一致：%s。两者读的是同一份驱动数据，'
+            '本应相同，nvidia-smi 的输出疑似被篡改' % '；'.join(diffs))
     # 10. NVLink 链路
     nl = g.get('nvl')
     exp = db and db.get('links')
@@ -1882,9 +1893,9 @@ def evaluate_gpu(g, target):
         if exp and nl['total'] < exp:
             add('nvlink', WARN, val, '只有 %d 条 NVLink 链路（%s 应为 %d 条）' % (nl['total'], db['sku'], exp))
         elif nl['inactive'] and nl['active'] == 0:
-            add('nvlink', WARN, val, 'NVLink 全部未激活（NVSwitch 机器请检查 nvidia-fabricmanager）')
+            add('nvlink', WARN, val, 'NVLink 链路全部未激活（有 NVSwitch 的机器请检查 nvidia-fabricmanager 服务）')
         elif nl['inactive']:
-            add('nvlink', WARN, val, 'NVLink 链路 %s 未激活（属健康问题，非真伪问题）'
+            add('nvlink', WARN, val, 'NVLink 链路 %s 未激活（这是硬件健康问题，与真伪无关）'
                 % ','.join(str(x) for x in nl['inactive']))
         else:
             add('nvlink', OK if exp else INFO, val, '')
@@ -1892,7 +1903,7 @@ def evaluate_gpu(g, target):
     pn = smi and smi.get('gpu_pn')
     if pn and devid is not None and re.match(r'^[0-9A-Fa-f]{4}-', pn):
         if pn[:4].lower() != '%04x' % devid:
-            add('partno', WARN, pn, 'GPU 部件号 %s 与硬件设备 ID 0x%04x 不对应' % (pn, devid))
+            add('partno', WARN, pn, 'GPU 部件号 %s 的前 4 位应与设备 ID（0x%04x）相同，实际对不上' % (pn, devid))
         else:
             add('partno', OK, pn, '')
     # 12. 架构 / 计算能力（主版本号）
@@ -1901,13 +1912,13 @@ def evaluate_gpu(g, target):
         sa = (smi and smi.get('arch') or '').strip()
         w = sa.split()[0].lower() if sa else ''
         if w in ARCH_WORDS and w != db['arch'].split()[0].lower():
-            bad.append('nvidia-smi 架构=%s' % sa)
+            bad.append('nvidia-smi 报告的架构是 %s' % sa)
         want = (db.get('cc') or '').split('.')[0]
         for src, rec in (('NVML', nv), ('CUDA', cu)):
             if want and rec and rec.get('cc') and rec['cc'].split('.')[0] != want:
-                bad.append('%s 计算能力=%s' % (src, rec['cc']))
+                bad.append('%s 报告的计算能力（compute capability）是 %s' % (src, rec['cc']))
         if bad:
-            add('arch', FAIL, '不一致', '%s 芯片却上报 %s —— 疑似篡改' % (db['arch'], '；'.join(bad)))
+            add('arch', FAIL, '不一致', '芯片是 %s 架构，但 %s，疑似被篡改' % (db['arch'], '；'.join(bad)))
 
     g['checks'] = checks
     by = dict((c['key'], c) for c in checks)
@@ -1915,20 +1926,22 @@ def evaluate_gpu(g, target):
     worst_all = max([c['level'] for c in checks] or [OK])
     if db:
         short = db['sku'].rsplit(' ', 1)[0] if re.search(r'\d+GB$', db['sku']) else db['sku']
-    else:       # 型号库不认识：用驱动报告的名称
+        actual = '实为 ' + short
+    else:       # 型号库不认识：只有驱动报告的名称，不能说“实为”
         short = re.sub(r'^NVIDIA\s+(GeForce\s+)?', '', names[0][1]) if names else '?'
+        actual = '驱动名称为 ' + short
     hw_lvl = by.get('hwid', {}).get('level')
     other = target is not None and target['key'] not in keys     # 识别出的型号与期望不同
     if hw_lvl == FAIL:
-        g['verdict'] = (FAIL, ('非%s: ' % target['fam'] if other else '形态不符: ') + short)
+        g['verdict'] = (FAIL, ('非 %s，' % target['fam'] if other else '形态不符，') + actual)
     elif worst_crit == FAIL:
-        g['verdict'] = (FAIL, '存疑: 数据矛盾')
+        g['verdict'] = (FAIL, '存疑，数据互相矛盾')
     elif worst_crit == WARN:
-        g['verdict'] = (WARN, '非%s: %s' % (target['fam'], short) if (hw_lvl == WARN and other and keys) else '待确认')
+        g['verdict'] = (WARN, '非 %s，%s' % (target['fam'], actual) if (hw_lvl == WARN and other and keys) else '待确认')
     elif g.get('memmod'):
-        g['verdict'] = (WARN, '真 %s(改装%dG显存)' % (short, g['memmod']))
+        g['verdict'] = (WARN, '真 %s（改装 %dGB 显存）' % (short, g['memmod']))
     elif worst_all >= WARN:
-        g['verdict'] = (WARN, '真 %s(有告警)' % short)
+        g['verdict'] = (WARN, '真 %s（有告警）' % short)
     else:
         g['verdict'] = (OK, '真 ' + short)
     g['auth'] = OK if g['verdict'][1].startswith('真 ') else g['verdict'][0]
@@ -1962,33 +1975,34 @@ def evaluate(ctx, args):
     verdicts = Counter(g['verdict'][1] for g in gpus)
     ctx['verdicts'] = verdicts
 
-    # ---------------- 工具链
+    # ---------------- 驱动软件（nvidia-smi / NVML / 驱动各组件是否被替换、篡改或劫持）
     drv, smi, nv = ctx['drv'], ctx['smi'], ctx['nvml']
     files = ctx['smi_files']
     if not files:
         if any(is_nv_gpu(p) for p in pci.values()):
-            F('工具链', WARN, '未找到 nvidia-smi（驱动未安装？），只能做硬件 ID 核验')
+            F('驱动软件', WARN, '未找到 nvidia-smi（驱动没装？），只能核对设备 ID')
     else:
         f0 = files[0]
         if G.test_mode:
             pass
         elif f0.get('elf') is False:
-            F('工具链', WARN, '%s 不是 ELF 可执行文件（%s），可能被包装或替换，请人工查看其内容：%s'
+            F('驱动软件', WARN, '%s 不是 ELF 二进制文件（实际是%s），可能被包装或替换过，请人工检查。文件开头几行：%s'
               % (f0['path'], '脚本' if f0.get('script') else '未知格式', clip(f0.get('head') or '-', 120)))
         if f0.get('pkg_ok') is False:
             run_ver = drv.get('kmod_version') or smi.get('driver')
             pv = f0.get('pkg_ver') or ''
             if run_ver and pv and not pv.split(':')[-1].startswith(run_ver):
-                F('工具链', WARN, 'nvidia-smi 与软件包 %s（版本 %s）校验不一致，而当前驱动为 %s：'
-                  '多半是用 .run 安装包覆盖了包管理器安装的驱动，建议人工确认（%s）'
+                F('驱动软件', WARN, 'nvidia-smi 与软件包 %s（版本 %s）里的原始文件不一致，但当前运行的驱动是 %s，'
+                  '与软件包版本不同：多半是用 .run 安装包覆盖了包管理器装的驱动，不一定是篡改，建议人工确认（%s）'
                   % (f0['pkg'], pv, run_ver, f0['path']))
             else:
-                F('工具链', FAIL, 'nvidia-smi 包校验不通过：%s，且版本相同 —— 文件在安装后被修改（%s）'
+                F('驱动软件', FAIL, 'nvidia-smi %s；而软件包版本与当前驱动相同，说明文件在安装后被修改过（%s）'
                   % (f0['pkg_msg'], f0['path']))
         if len(files) > 1:
-            F('工具链', WARN, 'PATH 中存在多个 nvidia-smi：%s（请确认来源）' % '、'.join(f['path'] for f in files))
+            F('驱动软件', WARN, 'PATH 里有多个 nvidia-smi：%s，请确认实际运行的是哪一个、来源是否可靠'
+              % '、'.join(f['path'] for f in files))
     if files and not smi['ok']:
-        F('工具链', WARN, 'nvidia-smi 执行失败：%s' % smi['error'])
+        F('驱动软件', WARN, 'nvidia-smi 执行失败：%s' % smi['error'])
     vers = {}
     if drv.get('kmod_version'):
         vers['内核模块'] = drv['kmod_version']
@@ -2003,20 +2017,22 @@ def evaluate(ctx, args):
     kv_ = vers.get('内核模块')
     forged = [k for k in ('nvidia-smi', 'NVML') if kv_ and vers.get(k) and vers[k] != kv_]
     if forged:
-        F('工具链', FAIL, '驱动版本不一致：%s（%s 上报的版本与已加载的内核模块不同却能正常工作，输出疑似被伪造）'
+        F('驱动软件', FAIL, '驱动各组件版本不一致：%s。%s 报告的版本与已加载的内核模块不同，却还能正常工作'
+          '（正常情况下版本不匹配会直接报错），输出疑似被伪造'
           % ('，'.join('%s=%s' % x for x in vers.items()), '、'.join(forged)))
     elif len(set(vers.values())) > 1:
-        F('工具链', WARN, '驱动组件版本不一致：%s（升级驱动后未重启？）' % '，'.join('%s=%s' % x for x in vers.items()))
+        F('驱动软件', WARN, '驱动各组件版本不一致：%s（升级驱动后还没重启？）' % '，'.join('%s=%s' % x for x in vers.items()))
     if smi['ok'] and nv['ok'] and len(nv['gpus']) != len(smi['gpus']):
-        F('工具链', WARN, 'nvidia-smi 看到 %d 张 GPU，NVML 直连看到 %d 张' % (len(smi['gpus']), len(nv['gpus'])))
+        F('驱动软件', WARN, 'nvidia-smi 看到 %d 张 GPU，直接调用 NVML 看到 %d 张' % (len(smi['gpus']), len(nv['gpus'])))
     if drv.get('preload_file'):
-        F('工具链', WARN, '/etc/ld.so.preload 非空：%s（可劫持 NVML 调用，请确认）' % '、'.join(drv['preload_file']))
+        F('驱动软件', WARN, '/etc/ld.so.preload 里配置了预加载库：%s。它会被注入到所有程序中，可以劫持 NVML 调用，请确认来源'
+          % '、'.join(drv['preload_file']))
     if drv.get('preload_env'):
-        F('工具链', WARN, '当前环境设置了 LD_PRELOAD=%s（本脚本调用外部命令时已剔除）' % drv['preload_env'])
+        F('驱动软件', WARN, '当前环境设置了 LD_PRELOAD=%s（本脚本调用外部命令时已将它去掉）' % drv['preload_env'])
     if smi['ok'] and not nv['ok']:
-        F('工具链', WARN, 'NVML 直连不可用（%s），无法与 nvidia-smi 输出交叉验证' % nv['error'])
+        F('驱动软件', WARN, '无法直接调用 NVML（%s），没法与 nvidia-smi 的输出交叉核对' % nv['error'])
     if args.cuda and ctx.get('cuda') and not ctx['cuda']['ok']:
-        F('工具链', WARN if smi['ok'] else INFO, 'CUDA 属性查询失败：%s' % ctx['cuda']['error'])
+        F('驱动软件', WARN if smi['ok'] else INFO, 'CUDA 属性查询失败：%s' % ctx['cuda']['error'])
 
     # ---------------- 系统：GPU 数量、驱动绑定
     hw = [p for p in pci.values() if is_nv_gpu(p)]
@@ -2025,35 +2041,35 @@ def evaluate(ctx, args):
     if unbound:
         F('系统', WARN, '%d 张 GPU 未绑定任何驱动：%s' % (len(unbound), ', '.join(short_bdf(b) for b in unbound)))
     if vfio:
-        F('系统', INFO, '%d 张 GPU 绑定 vfio-pci（直通给虚拟机），仅能做硬件 ID 核验' % len(vfio))
+        F('系统', INFO, '%d 张 GPU 绑定在 vfio-pci 上（直通给虚拟机用），只能核对设备 ID' % len(vfio))
     on_nv = [p for p in hw if p.get('driver') == 'nvidia']
     if smi['ok'] and on_nv and len(smi['gpus']) != len(on_nv):
-        F('工具链', WARN, 'PCI 上绑定 nvidia 驱动的 GPU 有 %d 张，nvidia-smi 只看到 %d 张%s'
-          % (len(on_nv), len(smi['gpus']), '（容器内运行时属正常）' if ctx['sys']['container'] else ''))
+        F('驱动软件', WARN, '绑定了 nvidia 驱动的 GPU 有 %d 张，nvidia-smi 只看到 %d 张%s'
+          % (len(on_nv), len(smi['gpus']), '（在容器内运行时属正常）' if ctx['sys']['container'] else ''))
     nvsw = [p for p in pci.values() if is_nvswitch(p)]
     sxm = [g for g in gpus if g['db'] and g['db']['form'].startswith('SXM')]
     exp_n = args.expect_gpus or (8 if (len(nvsw) >= 4 and sxm) else None)
     if exp_n and len(hw or gpus) != exp_n:
-        F('系统', WARN, 'GPU 数量 %d 张，期望 %d 张（少卡/掉卡？）' % (len(hw or gpus), exp_n))
+        F('系统', WARN, '看到 %d 张 GPU，期望 %d 张（缺卡或掉卡？）' % (len(hw or gpus), exp_n))
     vb = set(g['smi']['vbios'] for g in gpus if g['smi'] and g['smi'].get('vbios'))
     if len(vb) > 1:
         F('系统', INFO, 'GPU 之间 VBIOS 版本不一致：%s' % '、'.join(sorted(vb)))
     if ctx['sys']['virt'] not in (None, 'none'):
-        F('系统', INFO, '运行在虚拟化环境（%s）：PCI ID 由虚拟化层透传呈现，判定以驱动/NVML 交叉核验为准'
+        F('系统', INFO, '运行在虚拟机里（%s）：看到的 PCI ID 由虚拟化层提供，判定主要依据驱动和 NVML 之间的交叉核对'
           % ctx['sys']['virt'])
 
     # ---------------- NVLink / NVSwitch / Fabric Manager
     fm = ctx['fm']
     if nvsw and sxm:
         if fm.get('active') != 'active':
-            F('NVLink', WARN, 'NVSwitch 机器上 nvidia-fabricmanager 未运行（状态：%s），NVLink/CUDA 可能不可用'
-              % (fm.get('active') or ('未安装' if fm.get('load') == 'not-found' else '未知')))
+            F('NVLink', WARN, '本机有 NVSwitch，但 nvidia-fabricmanager 未运行（状态：%s），GPU 之间的 NVLink 通信和 CUDA '
+              '都可能用不了' % (fm.get('active') or ('未安装' if fm.get('load') == 'not-found' else '未知')))
         bad = [g['idx'] for g in gpus if g['smi'] and g['smi'].get('fabric_state')
                and (g['smi']['fabric_state'] != 'Completed' or (g['smi'].get('fabric_status') or 'Success') != 'Success')]
         if bad:
-            F('NVLink', WARN, 'GPU %s 的 Fabric 状态未完成/失败' % compress_ids(bad))
+            F('NVLink', WARN, 'GPU %s 加入 NVLink 网络（Fabric）未完成或失败' % compress_ids(bad))
         if fm.get('version') and drv.get('kmod_version') and not fm['version'].startswith(drv['kmod_version']):
-            F('NVLink', WARN, 'Fabric Manager 版本 %s 与驱动 %s 不一致' % (fm['version'], drv['kmod_version']))
+            F('NVLink', WARN, 'Fabric Manager 版本 %s 与驱动版本 %s 不一致（两者必须一致）' % (fm['version'], drv['kmod_version']))
         if len(sxm) == 8 and len(nvsw) not in (0, 4) and any(g['db']['family'] == 'H100' for g in sxm):
             F('NVLink', WARN, 'HGX H100 8 卡应有 4 颗 NVSwitch，实际看到 %d 颗' % len(nvsw))
     topo = ctx['topo']
@@ -2068,16 +2084,17 @@ def evaluate(ctx, args):
                     if v and (not v.startswith('NV') or (want and v != 'NV%d' % want)):
                         badp.append('%s-%s=%s' % (a, b, v))
         if badp:
-            F('NVLink', WARN, 'GPU 互联不是全 NV%s：%s%s' % (want or '#', '，'.join(badp[:6]),
-                                                       ' 等 %d 对' % len(badp) if len(badp) > 6 else ''))
+            should = 'NV%d（%d 条 NVLink）' % (want, want) if want else 'NVLink'
+            F('NVLink', WARN, 'GPU 之间应全部通过 %s 互联，以下 GPU 对不是：%s%s'
+              % (should, '，'.join(badp[:6]), '，共 %d 对' % len(badp) if len(badp) > 6 else ''))
     elif sxm and not topo['ok'] and smi['ok']:
-        F('NVLink', WARN, '无法获取拓扑（nvidia-smi topo -m）：%s' % s(topo.get('error')))
+        F('NVLink', WARN, '无法获取 GPU 互联拓扑（nvidia-smi topo -m）：%s' % s(topo.get('error')))
     errs = [(g['idx'], g['nvl']['errors']) for g in gpus if g.get('nvl') and g['nvl'].get('errors')]
     if errs:
-        F('NVLink', INFO, 'NVLink 错误计数非零：%s（累计值，建议观察是否持续增长）'
+        F('NVLink', INFO, 'NVLink 错误计数不为 0：%s（这是累计值，建议隔一段时间再看是否还在增长）'
           % '，'.join('GPU%s=%d' % e for e in errs))
     if ctx['xid'].get('sxid'):
-        F('NVLink', WARN, '内核日志中有 %d 条 NVSwitch SXid 错误' % ctx['xid']['sxid'])
+        F('NVLink', WARN, '内核日志里有 %d 条 NVSwitch 错误（SXid）' % ctx['xid']['sxid'])
 
     # ---------------- IB / RDMA
     hcas = [h for h in ctx['ib'] if not h.get('is_vf')]
@@ -2088,23 +2105,26 @@ def evaluate(ctx, args):
         for pt in h['ports']:
             name = '%s/%s' % (h['dev'], pt['port'])
             if pt['state'] != 'ACTIVE':
-                why = ('物理链路已通但端口未激活，检查子网管理器 SM' if pt['phys'] == 'LinkUp'
-                       else '未连线或链路故障')
+                why = ('物理链路已通，但端口没有激活：请检查 IB 网络的 Subnet Manager（如 opensm、UFM）'
+                       if pt['phys'] == 'LinkUp' else '没接线、对端没开或链路故障')
                 F('IB/RDMA', WARN, '%s 端口状态 %s / %s（%s）' % (name, s(pt['state']), s(pt['phys']), why))
             elif pt['link_layer'] == 'InfiniBand':
                 rates[(pt['rate'] or '').split('(')[0].strip()] += 1
             c = pt['counters']
             if c.get('link_downed') or c.get('symbol_error') or c.get('port_rcv_errors'):
-                F('IB/RDMA', INFO, '%s 错误计数：link_downed=%s symbol_error=%s rcv_errors=%s（累计值）'
+                F('IB/RDMA', INFO, '%s 错误计数：link_downed=%s symbol_error=%s rcv_errors=%s'
+                  '（这是累计值，建议隔一段时间再看是否还在增长）'
                   % (name, c.get('link_downed', 0), c.get('symbol_error', 0), c.get('port_rcv_errors', 0)))
         if h['cur_gen'] and h['max_gen'] and (h['cur_gen'] < h['max_gen'] or
                                               (h['cur_w'] and h['max_w'] and h['cur_w'] != h['max_w'])):
-            F('PCIe', WARN, '%s（%s）PCIe 降级：当前 %s，能力 %s' % (h['dev'], h['model'], h['link'], h['link_max']))
+            F('PCIe', WARN, '%s（%s）PCIe 降级运行：当前 %s，最高支持 %s'
+              % (h['dev'], h['model'], h['link'], h['link_max']))
     if len(rates) > 1:
         F('IB/RDMA', WARN, 'IB 端口速率不一致：%s' % '，'.join('%s x%d' % kv for kv in rates.most_common()))
     pro = [g for g in gpus if not (g['db'] and g['db']['tier'] == 'gf')]    # GeForce 不支持 GPUDirect RDMA
     if hcas and pro and not ({'nvidia_peermem', 'nv_peer_mem'} & ctx['modules']):
-        F('IB/RDMA', INFO, '未加载 nvidia_peermem 模块（GPUDirect RDMA 需要；使用 DMA-BUF 方案可忽略）')
+        F('IB/RDMA', INFO, '未加载 nvidia_peermem 内核模块：GPUDirect RDMA（网卡直接读写 GPU 显存）需要它；'
+          '如果用的是 DMA-BUF 方式，可以忽略')
 
     # ---------------- PCIe（GPU）
     for g in gpus:
@@ -2113,12 +2133,12 @@ def evaluate(ctx, args):
             continue
         mw, cw = p.get('max_width'), p.get('cur_width')
         if mw and mw.isdigit() and int(mw) < 16 and g['db'] and g['db']['arch'] == 'Hopper':
-            F('PCIe', WARN, 'GPU %s 的 PCIe 最大宽度仅 x%s' % (g['idx'], mw))
+            F('PCIe', WARN, 'GPU %s 的 PCIe 最多只支持 x%s（Hopper 应为 x16）' % (g['idx'], mw))
         elif mw and cw and cw.isdigit() and mw.isdigit() and int(cw) < int(mw):
-            F('PCIe', WARN, 'GPU %s PCIe 降宽：当前 x%s，能力 x%s' % (g['idx'], cw, mw))
+            F('PCIe', WARN, 'GPU %s 的 PCIe 链路宽度降级：当前 x%s，最高支持 x%s' % (g['idx'], cw, mw))
         mg = pcie_gen(p.get('max_speed'))
         if mg and g['db'] and g['db']['arch'] == 'Hopper' and mg < 5:
-            F('PCIe', WARN, 'GPU %s 的 PCIe 能力仅 Gen%d（Hopper 应为 Gen5）' % (g['idx'], mg))
+            F('PCIe', WARN, 'GPU %s 的 PCIe 最高只支持 Gen%d（Hopper 应为 Gen5）' % (g['idx'], mg))
 
     # ---------------- GPU 健康（只读快照）
     xid_by = {}
@@ -2135,19 +2155,19 @@ def evaluate(ctx, args):
         if not d:
             continue
         if d.get('ecc') == 'Disabled' and g['db'] and g['db']['tier'] == 'dc':
-            H(WARN, i, '{G} 的 ECC 已关闭（数据中心卡默认开启，关闭后显存位翻转无法发现和纠正）')
+            H(WARN, i, '{G} 的 ECC 已关闭（数据中心卡默认开启；关闭后，显存出现比特翻转既发现不了也纠正不了）')
         if d.get('ecc_vol_unc'):
-            H(WARN, i, '{G} 本次启动后出现 %d 个不可纠正 ECC 错误' % d['ecc_vol_unc'])
+            H(WARN, i, '{G} 驱动本次加载以来出现了 %d 个不可纠正 ECC 错误' % d['ecc_vol_unc'])
         if d.get('ecc_agg_unc'):
-            H(INFO, i, '{G} 累计不可纠正 ECC 错误 %d 个（历史值）' % d['ecc_agg_unc'])
+            H(INFO, i, '{G} 历史上累计出现过 %d 个不可纠正 ECC 错误' % d['ecc_agg_unc'])
         if d.get('rr_failure') == 'Yes':
-            H(FAIL, i, '{G} 行重映射失败（显存故障，建议报修）')
+            H(FAIL, i, '{G} 显存行重映射（row remapping）失败，说明显存有故障，建议报修')
         if d.get('rr_pending') == 'Yes':
-            H(WARN, i, '{G} 有待生效的行重映射（需在维护窗口复位 GPU）')
+            H(WARN, i, '{G} 有待生效的行重映射（row remapping），需要在维护窗口复位 GPU 才能生效')
         if d.get('reset_required') == 'Yes' or d.get('drain_reset') == 'Yes':
-            H(WARN, i, '{G} 驱动建议复位 GPU')
+            H(WARN, i, '{G} 驱动提示需要复位 GPU')
         if d.get('recovery') and d['recovery'] not in ('None', 'GPU_RECOVERY_ACTION_NONE'):
-            H(WARN, i, '{G} 驱动建议恢复动作：%s' % d['recovery'])
+            H(WARN, i, '{G} 驱动建议的恢复操作：%s' % d['recovery'])
         if d.get('temp') and d['temp'] >= 85:
             H(WARN, i, '{G} 核心温度 %d°C 偏高' % d['temp'])
         if d.get('mem_temp') and d['mem_temp'] >= 90:
@@ -2158,16 +2178,17 @@ def evaluate(ctx, args):
         codes = xid_by.get(g['bdf'][:-2], [])
         hard = sorted(set(c for c in codes if c not in XID_APP))
         if hard:
-            H(WARN, i, '{G} 内核日志有 Xid %s' % '、'.join(
-                '%d(%s)' % (c, XID_DESC.get(c, '见 NVIDIA Xid 文档')) for c in hard))
+            H(WARN, i, '{G} 内核日志里有 Xid %s' % '、'.join(
+                '%d（%s）' % (c, XID_DESC.get(c, '含义见 NVIDIA 的 Xid 文档')) for c in hard))
         elif codes:
-            H(INFO, i, '{G} 内核日志有应用类 Xid %s' % '、'.join(str(c) for c in sorted(set(codes))))
+            H(INFO, i, '{G} 内核日志里有 Xid %s（这类错误多由应用程序引起，一般不是硬件问题）'
+              % '、'.join(str(c) for c in sorted(set(codes))))
         if g['cfg'] and g['cfg']['vendor'] == 0xffff:
-            H(FAIL, i, '{G} PCI 配置空间无响应（掉卡？）')
+            H(FAIL, i, '{G} 的 PCI 配置空间没有响应（掉卡了？）')
     for (lvl, msg), ids in hb.items():
-        F('GPU健康', lvl, msg.replace('{G}', 'GPU ' + compress_ids(ids)))
+        F('GPU 健康', lvl, msg.replace('{G}', 'GPU ' + compress_ids(ids)))
     if not ctx['xid']['ok']:
-        F('GPU健康', INFO, '未检查 Xid：%s' % ctx['xid']['error'])
+        F('GPU 健康', INFO, '没有检查 Xid：%s' % ctx['xid']['error'])
 
 
 # ============================================================================
@@ -2188,18 +2209,18 @@ def render(ctx, args, elapsed):
     rep.add(bold('=' * W))
     rep.add('  主机: %s    时间: %s    用户: %s    耗时: %.1fs'
             % (st['hostname'], time.strftime('%Y-%m-%d %H:%M:%S %Z'), 'root' if G.is_root else '非 root', elapsed))
-    rep.add('  模式: 只读（不创建 CUDA 上下文 / 不占显存 / 不跑负载 / 不改任何配置），nice 19 + ionice idle'
-            + ('；已启用 --cuda 设备属性查询（无上下文）' if args.cuda else ''))
+    rep.add('  模式: 只读（不创建 CUDA 上下文、不占显存、不跑负载、不改任何配置），以最低优先级运行（nice 19 + ionice idle）'
+            + ('；已启用 --cuda，额外读取 CUDA 设备属性（不创建上下文）' if args.cuda else ''))
     exp = args.exp
     if exp is None:
         goal = '不限型号，只检查各数据源是否一致、规格是否与识别出的型号吻合'
     elif exp['form']:
-        goal = exp['label'] + (' / NVLink 版' if exp['form'] == 'SXM' else ' 版')
+        goal = exp['label'] + ('，即 NVLink 版' if exp['form'] == 'SXM' else ' 版')
     else:
-        goal = exp['label'] + ('，任意形态均可' if exp['key'] == 'H100' else '')
+        goal = exp['label'] + ('，SXM5 / PCIe / NVL 任意形态均可' if exp['key'] == 'H100' else '')
     rep.add('  核验目标: %s（--expect %s%s）' % (goal, args.expect, '，默认值' if args.expect == DEFAULT_EXPECT else ''))
     if not G.is_root:
-        rep.add('  ' + yellow('提示: 非 root 运行，内存条、整机序列号、网卡料号、内核日志等信息可能缺失'))
+        rep.add('  ' + yellow('提示: 当前不是以 root 运行，内存条型号、整机序列号、网卡料号、内核日志（Xid）等信息可能读不到'))
 
     for fn, a in ((render_system, ()), (render_hw, ()), (render_gpu_list, ()), (render_authenticity, (args,)),
                   (render_nvlink, ()), (render_ib, ()), (render_eth, ()), (render_health, ())):
@@ -2209,27 +2230,35 @@ def render(ctx, args, elapsed):
             ERRORS.append('报告 %s：%s: %s' % (fn.__name__, type(e).__name__, e))
             rep.note('（本节输出出错，已跳过：%s）' % e)
     if ERRORS:
-        rep.section('附：脚本自身异常（不影响其它检测项，请反馈给脚本维护者）')
+        rep.section('附：脚本自身出错（不影响其它检测项，请反馈给脚本维护者）')
         for e in ERRORS:
             rep.add('  - ' + e)
     render_conclusion(rep, ctx, args)
     return rep
 
 
+FM_STATE = {'active': '运行中', 'inactive': '未运行', 'failed': '启动失败', 'activating': '正在启动',
+            'deactivating': '正在停止'}
+
+
+def fm_text(fm):
+    """Fabric Manager 服务状态，如“未运行（inactive / dead），版本 550.54.15-1”"""
+    if fm.get('load') == 'not-found' or (not fm.get('active') and not fm.get('version')):
+        return '未安装'
+    raw = ' / '.join(x for x in (fm.get('active'), fm.get('sub')) if x)
+    return '%s%s%s' % (FM_STATE.get(fm.get('active'), '状态未知'), '（%s）' % raw if raw else '',
+                       '，版本 %s' % fm['version'] if fm.get('version') else '')
+
+
 def render_system(rep, ctx):
     st, drv, smi, fm, ofed = ctx['sys'], ctx['drv'], ctx['smi'], ctx['fm'], ctx['ofed']
     rep.section('一、系统概览')
-    need_root = '(需 root)' if not G.is_root else '-'
+    need_root = '(需 root 权限)' if not G.is_root else '-'
     gsp = next((g['smi']['gsp'] for g in ctx['gpus'] if g['smi'] and g['smi'].get('gsp')), None)
     if drv.get('kmod_version'):
         kmod = '%s（%s）' % (drv['kmod_version'], '开源内核模块' if drv.get('kmod_open') else '闭源内核模块')
     else:
         kmod = red('未加载 NVIDIA 驱动') if any(is_nv_gpu(p) for p in ctx['pci'].values()) else '-'
-    if fm.get('load') == 'not-found' or (not fm.get('active') and not fm.get('version')):
-        fm_txt = '未安装'
-    else:
-        fm_txt = '%s%s%s' % (s(fm.get('active')), ' (%s)' % fm['sub'] if fm.get('sub') else '',
-                             '，版本 %s' % fm['version'] if fm.get('version') else '')
     virt = st['virt'] if st['virt'] not in (None, 'none') else '物理机'
     if st['container']:
         virt += '（容器内）'
@@ -2241,12 +2270,12 @@ def render_system(rep, ctx):
         ('BIOS', ' '.join(x for x in (st['bios_vendor'], st['bios_version'], st['bios_date']) if x) or '-'),
         ('操作系统', s(st['os'])),
         ('内核', '%s (%s)' % (s(st['kernel']), st['arch'])),
-        ('运行时长', s(st['uptime'])),
+        ('开机时长', s(st['uptime'])),
         ('运行环境', virt),
         ('NVIDIA 驱动', kmod),
-        ('CUDA 版本(驱动)', s(smi.get('cuda'))),
+        ('驱动支持的 CUDA 版本', s(smi.get('cuda'))),
         ('GSP 固件', s(gsp)),
-        ('Fabric Manager', fm_txt),
+        ('Fabric Manager', fm_text(fm)),
         ('OFED / 网卡驱动', ofed.get('ofed') or ('内核自带 mlx5 驱动' if ctx['ib'] else '-')),
     ])
 
@@ -2257,14 +2286,14 @@ def render_hw(rep, ctx):
     dimms = mem.get('dimms')
     if dimms is not None:
         pop = [d for d in dimms if _size_gb(d.get('Size')) not in (None, 0)]
-        dimm_txt = '%d / %d 槽位已插' % (len(pop), len(dimms))
+        dimm_txt = '已插 %d 条，共 %d 个槽位' % (len(pop), len(dimms))
     else:
         pop = []
-        dimm_txt = '(%s%s)' % (mem.get('dimm_note') or '无数据',
+        dimm_txt = '（%s%s）' % (mem.get('dimm_note') or '无数据',
                                '；容器内一般读不到 SMBIOS，请在宿主机上运行' if ctx['sys'].get('container') else '')
     rep.kv([
         ('CPU 型号', s(cpu['model'])),
-        ('路数 / 核数 / 线程', '%s 路 / %s 核 / %s 线程' % (s(cpu['sockets']), s(cpu['cores']), s(cpu['threads']))),
+        ('路数 / 核数 / 线程数', '%s 路 / %s 核 / %s 线程' % (s(cpu['sockets']), s(cpu['cores']), s(cpu['threads']))),
         ('NUMA 节点', s(cpu['numa'])),
         ('内存总量', '%.0f GiB（操作系统可见）' % mem['total_gib'] if mem['total_gib'] else '-'),
         ('内存条', dimm_txt),
@@ -2275,7 +2304,7 @@ def render_hw(rep, ctx):
             speed = d.get('Speed', '-')
             cfgs = d.get('Configured Memory Speed') or d.get('Configured Clock Speed')
             if cfgs and cfgs != speed:
-                speed = '%s (运行 %s)' % (speed, cfgs)
+                speed = '%s（实际运行 %s）' % (speed, cfgs)
             grp[(d.get('Size', '-'), d.get('Type', '-'), speed, d.get('Manufacturer', '-'),
                  d.get('Part Number', '-').strip())] += 1
         rep.table(['数量', '单条容量', '类型', '速率', '厂商', '型号'],
@@ -2319,8 +2348,8 @@ def render_gpu_list(rep, ctx):
                      fmt_link(p.get('max_speed'), p.get('max_width')), s(p.get('numa') if p.get('numa', -1) >= 0 else None),
                      s(d.get('vbios')), s(d.get('serial')), s(d.get('module_id')),
                      s(p.get('driver'), red('无驱动') if p else '-')])
-    rep.table(['GPU', 'PCI', '型号(nvidia-smi)', '显存', '功耗墙 当前/最大', '最大频率 SM/显存', 'PCIe 能力',
-               'NUMA', 'VBIOS', '序列号', '模块', '驱动'], rows, aligns='r')
+    rep.table(['GPU', 'PCI 地址', '型号(nvidia-smi)', '显存', '功耗墙 当前/最大', '最大频率 SM/显存(MHz)', 'PCIe 最高规格',
+               'NUMA', 'VBIOS', '序列号', '模组 ID', '内核驱动'], rows, aligns='r')
     rows = []
     for g in gpus:
         d = g['smi'] or {}
@@ -2328,7 +2357,7 @@ def render_gpu_list(rep, ctx):
                      s(d.get('persistence')), s(d.get('mig')), s(d.get('ecc'))])
     if any(g['smi'] for g in gpus):
         rep.table(['GPU', '板卡料号', 'GPU 部件号', 'InfoROM', 'UUID', '持久模式', 'MIG', 'ECC'], rows, aligns='r')
-    rep.note('序列号/模块号可与 GPU 模组实物标签、供应商装箱单逐一核对。')
+    rep.note('序列号、模组 ID 可以和 GPU 模组上的标签、供应商的装箱单逐一核对。')
 
 
 def render_authenticity(rep, ctx, args):
@@ -2351,37 +2380,38 @@ def render_authenticity(rep, ctx, args):
                      cell('names'), cell('sm'), cell('bus'), cell('mem'), cell('power'), cell('clock'),
                      cell('nvlink'), lv_cell(lvl, txt)])
     if rows:
-        rep.table(['GPU', 'PCI', '硬件ID', '硬件识别型号', '名称一致', 'SM', '显存位宽', '显存', '功耗墙',
+        rep.table(['GPU', 'PCI 地址', '设备 ID', '实际型号', '名称核对', 'SM 数', '显存位宽', '显存', '最大功耗墙',
                    '最大频率', 'NVLink', '结论'], rows, aligns='r')
+        rep.note('“实际型号”按设备 ID 识别；“名称核对”看驱动、NVML、nvidia-smi 等报告的型号名是否都与实际型号一致。')
     via = [g for g in gpus if g['db'] and g['db'].get('src') == 'pci.ids']
     if via:
-        rep.note('GPU %s 的设备 ID（%s）不在内置型号库中，型号按本机 pci.ids 识别，并与驱动/NVML/nvidia-smi 报告的名称核对；'
-                 '没有标准规格可比，可信度低于内置型号。' % (compress_ids([g['idx'] for g in via]),
-                                                  '、'.join(sorted(set('0x%04x' % g['devid'] for g in via)))))
+        rep.note('GPU %s 的设备 ID（%s）不在内置型号库中，型号是按本机 pci.ids 识别的，并与驱动、NVML、nvidia-smi '
+                 '报告的名称核对过；但没有标准规格可以比对，可信度不如内置型号。'
+                 % (compress_ids([g['idx'] for g in via]), '、'.join(sorted(set('0x%04x' % g['devid'] for g in via)))))
     # 异常明细
     bad = [f for f in Findings.items if f[0] == '真伪' and f[1] >= WARN]
     if bad:
         rep.sub('异常明细：')
         for cat, lvl, msg in bad:
             rep.add('    %s %s' % (lvl_color(lvl, '[%s]' % LEVEL_TEXT[lvl]), msg))
-    # 工具链完整性
-    rep.sub('工具链完整性（防 nvidia-smi / NVML 被替换或劫持）：')
+    # 驱动软件完整性
+    rep.sub('驱动软件完整性（检查 nvidia-smi、NVML 是否被替换或劫持）：')
     drv, smi, nv = ctx['drv'], ctx['smi'], ctx['nvml']
     rows = []
     files = ctx['smi_files']
     if files:
         f0 = files[0]
         if G.test_mode:
-            elf = (INFO, '测试模式跳过')
+            elf = (INFO, '测试模式，未检查')
         elif f0.get('elf'):
-            elf = (OK, 'ELF 可执行文件')
+            elf = (OK, 'ELF 二进制文件')
         else:
-            elf = (WARN, '不是 ELF（%s）' % ('脚本' if f0.get('script') else '未知格式'))
+            elf = (WARN, '不是 ELF 二进制文件（实际是%s）' % ('脚本' if f0.get('script') else '未知格式'))
         where = f0['path'] if f0['real'] == f0['path'] else '%s -> %s' % (f0['path'], f0['real'])
         rows.append(['nvidia-smi 文件', lv_cell(elf[0], LEVEL_TEXT[elf[0]]),
                      clip('%s，%s 字节，%s' % (elf[1], s(f0.get('size')), where), 100)])
         lvl = OK if f0['pkg_ok'] else (WARN if f0['pkg_ok'] is False else INFO)
-        lvl = max([lvl] + [l for c, l, m in Findings.items if c == '工具链' and 'nvidia-smi' in m and '软件包' in m])
+        lvl = max([lvl] + [l for c, l, m in Findings.items if c == '驱动软件' and 'nvidia-smi' in m and '软件包' in m])
         rows.append(['nvidia-smi 包校验', lv_cell(lvl, LEVEL_TEXT[lvl]), f0['pkg_msg']])
         rows.append(['nvidia-smi SHA256', '-', s(f0.get('sha256'))])
         if len(files) > 1:
@@ -2390,34 +2420,39 @@ def render_authenticity(rep, ctx, args):
         rows.append(['nvidia-smi 文件', lv_cell(WARN, '警告'), '未找到 nvidia-smi'])
     vers = ctx.get('versions', {})
     if vers:
-        lvl = max([OK] + [l for c, l, m in Findings.items if c == '工具链' and '版本不一致' in m])
-        rows.append(['驱动版本一致性', lv_cell(lvl, LEVEL_TEXT[lvl]), '，'.join('%s=%s' % kv for kv in vers.items())])
+        lvl = max([OK] + [l for c, l, m in Findings.items if c == '驱动软件' and '版本不一致' in m])
+        rows.append(['驱动各组件版本', lv_cell(lvl, LEVEL_TEXT[lvl]), '，'.join('%s=%s' % kv for kv in vers.items())])
     if nv['ok']:
-        rows.append(['NVML 直连交叉验证', lv_cell(OK, '通过'),
-                     clip('已绕过 nvidia-smi 直接调用 %s' % s(nv.get('lib')), 100)])
+        rows.append(['NVML 交叉核对', lv_cell(OK, '通过'),
+                     clip('绕过 nvidia-smi，直接调用 %s 读取数据' % s(nv.get('lib')), 100)])
     else:
-        rows.append(['NVML 直连交叉验证', lv_cell(WARN if smi['ok'] else INFO, '不可用'), s(nv.get('error'))])
+        rows.append(['NVML 交叉核对', lv_cell(WARN if smi['ok'] else INFO, '不可用'), s(nv.get('error'))])
     pre = drv.get('preload_file') or []
     lvl = WARN if (pre or drv.get('preload_env')) else OK
     rows.append(['LD_PRELOAD 劫持', lv_cell(lvl, LEVEL_TEXT[lvl]),
-                 '、'.join(pre + ([drv['preload_env']] if drv.get('preload_env') else [])) or '/etc/ld.so.preload 为空，无 LD_PRELOAD'])
-    cnt = [('PCI', len([p for p in ctx['pci'].values() if is_nv_gpu(p)])), ('驱动/proc', len(ctx['proc'])),
+                 '、'.join(pre + ([drv['preload_env']] if drv.get('preload_env') else []))
+                 or '/etc/ld.so.preload 为空，也没有设置 LD_PRELOAD'])
+    cnt = [('PCI', len([p for p in ctx['pci'].values() if is_nv_gpu(p)])), ('驱动（/proc）', len(ctx['proc'])),
            ('nvidia-smi', len(smi['gpus']) if smi['ok'] else None), ('NVML', len(nv['gpus']) if nv['ok'] else None)]
     cnt = [(k, v) for k, v in cnt if v is not None]
     lvl = OK if len(set(v for _, v in cnt)) <= 1 else WARN
-    rows.append(['GPU 数量一致性', lv_cell(lvl, LEVEL_TEXT[lvl]), '，'.join('%s=%d' % kv for kv in cnt)])
+    rows.append(['各来源的 GPU 数量', lv_cell(lvl, LEVEL_TEXT[lvl]), '，'.join('%s=%d' % kv for kv in cnt)])
     if drv.get('kmod_line'):
         rows.append(['内核模块', '-', clip(drv['kmod_line'], 90)])
-        rows.append(['模块 srcversion', '-', '%s（taint=%s，可与同版本正常机器比对）'
+        rows.append(['模块 srcversion', '-', '%s（taint=%s；可以和装了同版本驱动的正常机器比对）'
                      % (s(drv.get('srcversion')), s(drv.get('taint')))])
     rep.table(['检查项', '结果', '说明'], rows)
-    rep.note('判定方法（全部只读，多层交叉验证）：\n'
-             '  1) 硬件层：PCI 配置空间里的设备 ID 由 GPU 芯片熔丝决定，改名/改标签/改 nvidia-smi 都改不了；\n'
-             '     例：H100 SXM5=0x2330、H100 PCIe=0x2331，而 H20=0x2329、H800=0x2324；RTX 4090=0x2684，4090 D=0x2685；\n'
-             '  2) 驱动层：/proc 驱动型号、NVML 直连（绕过 nvidia-smi 程序）、nvidia-smi 三者都必须与硬件 ID 一致；\n'
-             '  3) 规格指纹：SM 数、显存位宽、显存容量、功耗墙、最大频率、NVLink 链路数与该型号标准值比对；\n'
-             '  4) 工具链：nvidia-smi 是否原厂 ELF、包管理器校验、驱动各组件版本一致性、LD_PRELOAD 劫持。\n'
-             '  局限：无法防御内核级伪造（修改内核 PCI 层）；如需算力实测，请在维护窗口对空闲 GPU 单独做压测。')
+    rep.note('判定方法（全程只读，几个数据源互相印证）：\n'
+             '  1) 设备 ID：由 GPU 芯片熔丝决定，改名字、贴标签、改 nvidia-smi 都改不了，是识别型号的主要依据；\n'
+             '     例如 H100 SXM5 是 0x2330、H100 PCIe 是 0x2331，而 H20 是 0x2329、H800 是 0x2324；'
+             'RTX 4090 是 0x2684，4090 D 是 0x2685；\n'
+             '  2) 驱动报告的型号：/proc 里的驱动信息、直接调用 NVML（nvidia-smi 底层用的驱动库）、nvidia-smi，'
+             '三者都要和设备 ID 对得上；\n'
+             '  3) 规格比对：SM 数（GPU 计算单元的数量）、显存位宽、显存容量、功耗墙、最大频率、NVLink 链路数，'
+             '要与该型号的标准值一致；\n'
+             '  4) 驱动软件：nvidia-smi 是不是原厂的 ELF 二进制文件、与软件包里的原始文件是否一致、驱动各组件版本是否一致、'
+             '有没有 LD_PRELOAD 劫持。\n'
+             '  局限：防不住内核级伪造（改内核或 PCI 层）；要实测算力，需要在维护窗口对空闲 GPU 单独压测。')
 
 
 def render_nvlink(rep, ctx):
@@ -2435,11 +2470,13 @@ def render_nvlink(rep, ctx):
             cells += [row.get('CPU Affinity', '-'), row.get('NUMA Affinity', '-') or '-']
             rows.append(cells)
         rep.sub('GPU 互联矩阵（nvidia-smi topo -m）：')
-        rep.table([''] + labels + ['CPU 亲和', 'NUMA'], rows, aligns='l' + 'c' * len(labels))
-        rep.note('NV# = 经 # 条 NVLink 互联（HGX 机型经 NVSwitch）；PIX/PXB = 经 PCIe 交换芯片；'
-                 'PHB = 经 CPU 根复合体；NODE = 同 NUMA 跨根复合体；SYS = 跨 NUMA')
+        rep.table([''] + labels + ['就近的 CPU 核', 'NUMA 节点'], rows, aligns='l' + 'c' * len(labels))
+        rep.note('NV# = 通过 # 条 NVLink 互联（HGX 机型经过 NVSwitch）\n'
+                 'PIX = 最多经过一个 PCIe 桥（通常在同一个 PCIe Switch 下）；PXB = 经过多个 PCIe 桥，但不经过 CPU\n'
+                 'PHB = 经过 CPU 上的 PCIe Host Bridge；NODE = 同一 NUMA 节点内，跨 PCIe Host Bridge；'
+                 'SYS = 跨 NUMA 节点（经过 CPU 之间的 QPI/UPI 等互联）')
     else:
-        rep.note('无法获取拓扑矩阵：%s' % s(topo.get('error'), 'nvidia-smi 不可用'))
+        rep.note('无法获取 GPU 互联矩阵：%s' % s(topo.get('error'), 'nvidia-smi 不可用'))
     nvsw = sorted(p['bdf'] for p in pci.values() if is_nvswitch(p))
     sw_idx = dict((b, i) for i, b in enumerate(nvsw))
     gpu_idx = dict((g['bdf'], g['idx']) for g in gpus)
@@ -2465,18 +2502,18 @@ def render_nvlink(rep, ctx):
                      dist_txt, s(nl.get('errors')), fab])
     if rows:
         rep.sub('NVLink 链路状态：')
-        rep.table(['GPU', '激活/总数', '单链速率', '合计(单向)', '未激活链路', '对端分布(NVML)', '错误计数', 'Fabric 状态'],
-                  rows)
+        rep.table(['GPU', '已激活/总数', '单条速率', '合计带宽(单向)', '未激活的链路', '对端:链路数(NVML)', '错误计数',
+                   'Fabric 状态'], rows)
     elif any(g['db'] and g['db'].get('links') for g in gpus):
-        rep.note('未读取到 NVLink 链路信息')
+        rep.note('没有读到 NVLink 链路信息')
     else:
-        rep.note('本机 GPU 无 NVLink（或未桥接）')
+        rep.note('本机 GPU 无 NVLink（或没有装 NVLink 桥）')
     if nvsw:
         devs = Counter(NVSWITCH_DB.get(pci[b]['device'], '0x%04x' % pci[b]['device']) for b in nvsw)
-        rep.add('  NVSwitch: %d 颗（%s）@ %s' % (len(nvsw), '，'.join('%s x%d' % kv for kv in devs.items()),
-                                              ', '.join('SW%d=%s' % (i, short_bdf(b)) for i, b in enumerate(nvsw))))
+        rep.add('  NVSwitch: %d 颗（%s），PCI 地址 %s' % (len(nvsw), '，'.join('%s x%d' % kv for kv in devs.items()),
+                                                    ', '.join('SW%d=%s' % (i, short_bdf(b)) for i, b in enumerate(nvsw))))
     if nvsw or fm.get('active') == 'active':
-        rep.add('  Fabric Manager: %s%s' % (s(fm.get('active'), '未安装'), '，版本 %s' % fm['version'] if fm.get('version') else ''))
+        rep.add('  Fabric Manager: %s' % fm_text(fm))
 
 
 def _nic_affinity(topo, gpus):
@@ -2518,11 +2555,11 @@ def render_ib(rep, ctx):
         v = h.get('vpd') or {}
         degraded = h['cur_gen'] and h['max_gen'] and (h['cur_gen'] < h['max_gen'] or h['cur_w'] != h['max_w'])
         link = '%s / %s' % (h['link'], h['link_max'])
-        rows.append([h['dev'], h['model'], s(v.get('PN'), '(需 root)' if not G.is_root else '-'), s(v.get('SN')),
+        rows.append([h['dev'], h['model'], s(v.get('PN'), '(需 root 权限)' if not G.is_root else '-'), s(v.get('SN')),
                      short_bdf(h['bdf']), s(h['numa'] if (h['numa'] is not None and h['numa'] >= 0) else None),
                      yellow(link) if degraded else link, s(h['fw']), s(h['psid'])])
     rep.sub('网卡硬件：')
-    rep.table(['设备', '型号', '料号(PN)', '序列号', 'PCI', 'NUMA', 'PCIe 当前/能力', '固件', 'PSID'], rows)
+    rep.table(['设备', '型号', '料号(PN)', '序列号', 'PCI 地址', 'NUMA', 'PCIe 当前/最高', '固件', 'PSID'], rows)
     descs = sorted(set(h['vpd']['ID'] for h in hcas if h.get('vpd') and h['vpd'].get('ID')))
     for dsc in descs:
         rep.note('型号描述: ' + dsc)
@@ -2539,16 +2576,17 @@ def render_ib(rep, ctx):
                          s(pt['lid']) if pt['link_layer'] == 'InfiniBand' else '-',
                          ','.join(h['netdevs']) or '-', ('GPU' + compress_ids(gl)) if gl else '-', err])
     rep.sub('端口状态：')
-    rep.table(['设备:端口', '链路层', '状态', '物理状态', '速率', 'LID', '网口', '亲和 GPU', 'down/symbol/rcv'], rows)
+    rep.table(['设备:端口', '链路层', '状态', '物理状态', '速率', 'LID', '网口', '就近 GPU', '错误 down/symbol/rcv'], rows)
     if g2n:
         rows = [['GPU%s' % i, ', '.join('%s(%s)' % x for x in g2n[i])] for i in sorted(g2n)]
-        rep.sub('GPU 与网卡亲和（GPUDirect RDMA 就近原则）：')
-        rep.table(['GPU', '最近的 RDMA 网卡（PIX=同一 PCIe 交换，PXB=多级 PCIe 交换）'], rows)
+        rep.sub('GPU 就近的 RDMA 网卡（用 GPUDirect RDMA 时，GPU 应优先走离它最近的网卡）：')
+        rep.table(['GPU', '最近的 RDMA 网卡（PIX = 同一个 PCIe Switch 下，PXB = 隔着多级 PCIe Switch）'], rows)
     mods = ctx['modules']
     stack = [m for m in ('mlx5_core', 'mlx5_ib', 'ib_core', 'ib_uverbs', 'nvidia_peermem', 'nv_peer_mem', 'gdrdrv',
                          'nvidia_fs') if m in mods]
     rep.add('  RDMA 软件栈: %s；已加载模块: %s%s' % (
-        ctx['ofed'].get('ofed') or '内核自带驱动', ', '.join(stack) or '-', '；另有 %d 个 VF 未列出' % vfs if vfs else ''))
+        ctx['ofed'].get('ofed') or '内核自带驱动', ', '.join(stack) or '-',
+        '；另有 %d 个 SR-IOV 虚拟网卡（VF）未列出' % vfs if vfs else ''))
 
 
 def render_eth(rep, ctx):
@@ -2567,16 +2605,16 @@ def render_eth(rep, ctx):
         rows.append([n['ifname'], clip(model, 44), typ, s(n['driver']), short_bdf(n['bdf']),
                      s(n['numa'] if (n['numa'] is not None and n['numa'] >= 0) else None), sp,
                      lv_cell(OK if n['state'] == 'up' else INFO, s(n['state'])), s(n['mtu'])])
-    rep.table(['网口', '型号', '类型', '驱动', 'PCI', 'NUMA', '速率', '状态', 'MTU'], rows)
+    rep.table(['网口', '型号', '类型', '驱动', 'PCI 地址', 'NUMA', '速率', '状态', 'MTU'], rows)
     if vfs:
-        rep.note('另有 %d 个 SR-IOV VF 网口未列出' % vfs)
+        rep.note('另有 %d 个 SR-IOV 虚拟网口（VF）未列出' % vfs)
 
 
 def render_health(rep, ctx):
     gpus = ctx['gpus']
     rep.section('八、GPU 运行状态（只读快照）')
     if not any(g['smi'] for g in gpus):
-        rep.note('nvidia-smi 不可用，无运行状态数据')
+        rep.note('nvidia-smi 不可用，没有运行状态数据')
         return
     rows = []
     for g in gpus:
@@ -2588,7 +2626,7 @@ def render_health(rep, ctx):
         mem = '%s/%s' % (iv(d.get('mem_used'), '0'), iv(d.get('mem_total')))
         unc = '%s/%s' % (s(d.get('ecc_vol_unc')), s(d.get('ecc_agg_unc')))
         unc = lv_cell(WARN, unc) if d.get('ecc_vol_unc') else unc
-        rr = '待处理' if d.get('rr_pending') == 'Yes' else ('失败' if d.get('rr_failure') == 'Yes' else '正常')
+        rr = '待生效' if d.get('rr_pending') == 'Yes' else ('失败' if d.get('rr_failure') == 'Yes' else '正常')
         rr = lv_cell(OK if rr == '正常' else (FAIL if rr == '失败' else WARN), rr) if d.get('rr_pending') else '-'
         thr = [THROTTLE_CN.get(t, t) for t in d.get('throttle', [])]
         thr_txt = lv_cell(WARN, ','.join(thr)) if any(t in THROTTLE_BAD for t in d.get('throttle', [])) else (','.join(thr) or '-')
@@ -2597,9 +2635,11 @@ def render_health(rep, ctx):
         rows.append(['GPU%s' % g['idx'], temp, pw, '%s%%' % iv(d.get('util'), '0'), mem,
                      str(d.get('procs', 0)), fmt_link(p.get('cur_speed'), p.get('cur_width')), s(d.get('ecc')), unc,
                      rr, thr_txt, lv_cell(WARN, xid) if codes else xid])
-    rep.table(['GPU', '温度 核心/显存', '功耗 当前/墙', '利用率', '显存 已用/总(MiB)', '进程', 'PCIe 当前', 'ECC',
-               '不可纠正ECC 本次/累计', '行重映射', '降频原因', 'Xid'], rows, aligns='l')
-    rep.note('空闲时 GPU 的 PCIe 会自动降速节能（如 Gen1），属正常现象；Xid 来源：%s' % s(ctx['xid'].get('src')))
+    rep.table(['GPU', '温度(°C) 核心/显存', '功耗 当前/上限', '利用率', '显存 已用/总量(MiB)', '进程数', 'PCIe 当前速率',
+               'ECC', '不可纠正 ECC 本次/累计', '行重映射', '降频原因', 'Xid'], rows, aligns='l')
+    rep.note('空闲时 GPU 的 PCIe 会自动降速节能（如降到 Gen1），属正常现象。\n'
+             '不可纠正 ECC：“本次”指驱动本次加载以来，“累计”指这张卡历史上的总数。\n'
+             'Xid 是 NVIDIA 驱动写进内核日志的 GPU 错误码，本次从 %s 读取。' % s(ctx['xid'].get('src')))
 
 
 def _skus(gpus):
@@ -2608,9 +2648,9 @@ def _skus(gpus):
 
 
 def auth_level(gpus):
-    """真伪总判定：任一卡不通过/工具链有篡改证据 = FAIL；有卡无法确认 = WARN；否则 OK"""
+    """真伪总判定：任一卡不通过/驱动软件有篡改证据 = FAIL；有卡无法确认 = WARN；否则 OK"""
     lvl = max([g.get('auth', g['verdict'][0]) for g in gpus] or [FAIL])
-    return FAIL if Findings.worst(['工具链']) == FAIL else lvl
+    return FAIL if Findings.worst(['驱动软件']) == FAIL else lvl
 
 
 def render_conclusion(rep, ctx, args):
@@ -2623,14 +2663,14 @@ def render_conclusion(rep, ctx, args):
         if cat == '真伪':
             vt = ctx.get('verdicts') or Counter()
             if lvl == OK and gpus:
-                msg = '%d/%d 张 GPU 确认为 %s（硬件 ID、驱动、NVML、规格指纹一致）' % (len(gpus), len(gpus), _skus(gpus))
+                msg = '%d/%d 张 GPU 确认为 %s（设备 ID、驱动报告的型号、规格都对得上）' % (len(gpus), len(gpus), _skus(gpus))
             else:
-                msg = '；'.join('%s（%d 张）' % kv for kv in vt.most_common()) or '无 GPU'
+                msg = '；'.join('%d 张：%s' % (n, v) for v, n in vt.most_common()) or '无 GPU'
         else:
             shown = [m for l, m in sorted(items, key=lambda x: -x[0]) if l >= WARN] or [m for l, m in items]
             msg = clip(shown[0], 96) if shown else '未发现问题'
             if len(shown) > 1:
-                msg += '（另 %d 项）' % (len(shown) - 1)
+                msg += '；另有 %d 项，见下方' % (len(shown) - 1)
         rows.append([cat, lv_cell(lvl, LEVEL_TEXT[lvl]), msg])
     rep.table(['类别', '结果', '摘要'], rows)
     auth = auth_level(gpus)
@@ -2651,26 +2691,27 @@ def render_conclusion(rep, ctx, args):
         if not gpus:
             rep.add(red('  总体结论：[不通过] 未发现任何 NVIDIA GPU。'))
         elif bad:
-            cnt = '；'.join('%s %d 张' % kv for kv in Counter(g['verdict'][1] for g in bad).items())
+            vc = Counter(g['verdict'][1] for g in bad)
+            cnt = '：' + next(iter(vc)) if len(vc) == 1 else '（%s）' % '；'.join('%d 张：%s' % (n, v) for v, n in vc.items())
             if all(g['verdict'][1].startswith('形态不符') for g in bad):
                 hints = [re.search(r'（(如果采购的就是[^）]*)）', c['detail']) for g in bad for c in g['checks']
                          if c['key'] == 'hwid']
                 hint = next((m.group(1) for m in hints if m), '')
-                rep.add(red('  总体结论：[不通过] %d 张 GPU 的形态与期望不符（%s）%s，详见第四节。'
-                            % (len(bad), cnt, '；' + hint if hint else '')))
+                rep.add(red('  总体结论：[不通过] %d 张 GPU 实为 %s，与期望的 %s 版不符%s。详见第四节。'
+                            % (len(bad), _skus(bad), args.exp['label'], '；' + hint if hint else '')))
             else:
-                rep.add(red('  总体结论：[不通过] %d 张 GPU 真伪核验不通过（%s），详见第四节。' % (len(bad), cnt)))
+                rep.add(red('  总体结论：[不通过] %d 张 GPU 真伪核验不通过%s。详见第四节。' % (len(bad), cnt)))
                 # 没指定 --expect、本机只是别的型号（没有篡改迹象）时，提示怎样指定期望型号
                 if args.expect == DEFAULT_EXPECT and all(
                         g['verdict'][1].startswith('非') and
                         [c['key'] for c in g['checks'] if c['level'] == FAIL] == ['hwid'] for g in bad):
                     rep.add('  %s：%s' % (cyan('提示'), expect_hint(bad, args.exp)))
         else:
-            rep.add(red('  总体结论：[不通过] 工具链疑似被篡改，GPU 信息不可信，详见第四节。'))
+            rep.add(red('  总体结论：[不通过] 驱动软件疑似被篡改，读到的 GPU 信息不可信，详见第四节。'))
     elif auth == WARN:
-        rep.add(yellow('  总体结论：[待确认] 真伪核验存在无法确认的项目，详见第四节。'))
+        rep.add(yellow('  总体结论：[待确认] 有的项目无法确认，暂时不能判定真伪，详见第四节。'))
     elif allw >= WARN:
-        rep.add(yellow('  总体结论：[通过，有告警] %d 张 GPU 确认为真 %s；另有 %d 项健康/配置告警，见上方“需关注”。'
+        rep.add(yellow('  总体结论：[通过，有告警] %d 张 GPU 确认为真 %s；另有 %d 项告警，见上方“需关注”。'
                        % (len(gpus), _skus(gpus), len(others))))
     else:
         rep.add(green('  总体结论：[通过] %d 张 GPU 确认为真 %s，未发现健康或配置问题。' % (len(gpus), _skus(gpus))))
@@ -2739,7 +2780,7 @@ def collect_all(args):
     step('PCI 设备')
     ctx['pci'] = safe('PCI 扫描', scan_pci, {})
     ctx['modules'] = safe('内核模块', loaded_modules, set())
-    step('NVIDIA 驱动与工具链完整性')
+    step('NVIDIA 驱动与 nvidia-smi 完整性')
     ctx['drv'] = safe('驱动信息', collect_driver, {'proc_ok': False})
     smi_paths = locate_all('nvidia-smi', ['/usr/bin', '/usr/local/bin', '/usr/local/nvidia/bin', '/opt/nvidia/bin'])
     ctx['smi_files'] = safe('nvidia-smi 完整性', lambda: [file_check(smi_paths[0])] + [dict(path=p) for p in smi_paths[1:]]
@@ -2748,7 +2789,7 @@ def collect_all(args):
     step('nvidia-smi -q（只读查询）')
     ctx['smi'] = safe('nvidia-smi', collect_smi, {'ok': False, 'error': '解析出错', 'gpus': []}, smi)
     ctx['proc'] = safe('/proc 驱动信息', collect_proc_gpus, {})
-    step('NVML 直连查询')
+    step('直接调用 NVML 查询')
     ctx['nvml'] = safe('NVML', collect_nvml, {'ok': False, 'error': '调用出错', 'gpus': {}}, args.nvml_lib)
     if args.cuda:
         step('CUDA 设备属性（无上下文）')
